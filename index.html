@@ -1,3 +1,8 @@
+顔が動かないのに背景が回るのは、背景の点を**顔の重心を中心に回転**させていたからです。背景は重心から遠いので、同じ角度でも大きく動きます。顔は重心の近くなのでほとんど動かず、背景だけが振られます。
+
+直し方は、背景は**回転させず、すぐ隣の顔ランドマークの動きに付いてこさせる**こと。あわせて顔自体にも少しだけ追従移動を入れます。
+
+```html
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -9,12 +14,13 @@
   #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
   canvas{max-width:100%;max-height:100%}
   #bar{position:fixed;left:0;right:0;bottom:0;padding:10px calc(10px + env(safe-area-inset-bottom));
-       display:flex;gap:8px;align-items:center;background:#000c;backdrop-filter:blur(8px)}
+       display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:#000c;backdrop-filter:blur(8px)}
+  #file{flex:0 1 110px;min-width:0;overflow:hidden;white-space:nowrap}
   button,input[type=file]::file-selector-button{font:inherit;padding:10px 14px;border-radius:10px;
        border:1px solid #444;background:#222;color:#eee}
   button:disabled{opacity:.4}
   #rec.on{background:#c33;border-color:#c33}
-  #pow{width:100px}
+  #pow{flex:1 1 120px;min-width:90px}
   label{display:flex;align-items:center;gap:4px;font-size:12px;color:#ccc}
   #hint{position:fixed;top:calc(10px + env(safe-area-inset-top));left:10px;right:10px;
        color:#aaa;font-size:12px;text-align:center;pointer-events:none}
@@ -46,7 +52,7 @@ const btnRec = document.getElementById('rec');
 const pow = document.getElementById('pow');
 const rot = document.getElementById('rot');
 
-let landmarker, srcPts = null, allPts = null, nFace = 0;
+let landmarker, srcPts = null, allPts = null, nFace = 0, near = null;
 let scx = 0, scy = 0;
 let srcTex = null, tris = [], buf = null, prog = null;
 let video = null, smooth = null, recorder = null, chunks = [], ts = 0;
@@ -159,12 +165,6 @@ const box = pts => {
   for (const p of pts) { a=Math.min(a,p.x); b=Math.min(b,p.y); c=Math.max(c,p.x); d=Math.max(d,p.y); }
   return { cx:(a+c)/2, cy:(b+d)/2, w:c-a, h:d-b };
 };
-
-const distToBox = (p, b) => {
-  const dx = Math.max(b.cx - b.w/2 - p.x, 0, p.x - (b.cx + b.w/2));
-  const dy = Math.max(b.cy - b.h/2 - p.y, 0, p.y - (b.cy + b.h/2));
-  return Math.hypot(dx, dy);
-};
 const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x-a)/(b-a))); return t*t*(3-2*t); };
 
 function makeFrame(facePts) {
@@ -200,6 +200,16 @@ document.getElementById('file').onchange = async e => {
     for (const p of srcPts) { scx += p.x; scy += p.y; }
     scx /= nFace; scy /= nFace;
     allPts = srcPts.concat(makeFrame(srcPts));
+    // 背景の各点に、いちばん近い顔ランドマークを割り当てる
+    near = new Uint16Array(allPts.length - nFace);
+    for (let i = nFace; i < allPts.length; i++) {
+      let best = 0, bd = 1e9;
+      for (let j = 0; j < nFace; j++) {
+        const d = (allPts[i].x - srcPts[j].x)**2 + (allPts[i].y - srcPts[j].y)**2;
+        if (d < bd) { bd = d; best = j; }
+      }
+      near[i - nFace] = best;
+    }
     tris = triangulate(allPts);
     if (tris.length < 100) { hint.textContent = 'メッシュ生成に失敗'; return; }
     if (!prog) initGL();
@@ -242,13 +252,12 @@ function loop() {
   const faceSize = Math.max(sb.w, sb.h) || 1;
   const gain = (pow.value / 100);
   const maxD = faceSize * 0.25;
-  const maxO = faceSize * 0.18;
+  const maxO = faceSize * 0.12;
 
   let ccx = 0, ccy = 0;
   for (let i = 0; i < nFace; i++) { ccx += smooth[i].x; ccy += smooth[i].y; }
   ccx /= nFace; ccy /= nFace;
 
-  // カメラ顔 → 写真顔 の相似変換を最小二乗で推定
   let re = 0, im = 0, den = 0;
   for (let i = 0; i < nFace; i++) {
     const ax = smooth[i].x - ccx, ay = smooth[i].y - ccy;
@@ -269,6 +278,23 @@ function loop() {
     return [scx + cs*ax - sn*ay, scy + sn*ax + cs*ay];
   };
 
+  // 顔全体の追従移動（弱め・上限あり）
+  const gx0 = (ccx - scx) * 0.25, gy0 = (ccy - scy) * 0.25;
+  const gl0 = Math.hypot(gx0, gy0), gmax = faceSize * 0.1;
+  const t0x = gl0 > gmax ? gx0 * gmax / gl0 : gx0;
+  const t0y = gl0 > gmax ? gy0 * gmax / gl0 : gy0;
+
+  // 顔ランドマークの変位を先に確定させる
+  const ddx = new Float32Array(nFace), ddy = new Float32Array(nFace);
+  for (let i = 0; i < nFace; i++) {
+    const [rx, ry] = rigid(smooth[i].x, smooth[i].y);
+    let dx = (rx - srcPts[i].x) * gain + t0x;
+    let dy = (ry - srcPts[i].y) * gain + t0y;
+    const len = Math.hypot(dx, dy);
+    if (len > maxD) { dx *= maxD / len; dy *= maxD / len; }
+    ddx[i] = dx; ddy[i] = dy;
+  }
+
   const arr = new Float32Array(tris.length * 3 * 4);
   let o = 0;
   for (const tr of tris) {
@@ -278,16 +304,13 @@ function loop() {
       const s = allPts[id];
       let tx = s.x, ty = s.y;
       if (id < nFace) {
-        const [rx, ry] = rigid(smooth[id].x, smooth[id].y);
-        let dx = (rx - s.x) * gain, dy = (ry - s.y) * gain;
-        const len = Math.hypot(dx, dy);
-        if (len > maxD) { dx *= maxD / len; dy *= maxD / len; }
-        tx = s.x + dx; ty = s.y + dy;
+        tx = s.x + ddx[id]; ty = s.y + ddy[id];
       } else {
-        const w = 1 - sstep(0, 1.2, distToBox(s, sb) / faceSize);
+        const ni = near[id - nFace];
+        const d = Math.hypot(s.x - srcPts[ni].x, s.y - srcPts[ni].y) / faceSize;
+        const w = 1 - sstep(0, 1.0, d);
         if (w > 0.001) {
-          const [rx, ry] = rigid(s.x, s.y);
-          let dx = (rx - s.x) * w, dy = (ry - s.y) * w;
+          let dx = ddx[ni] * w * 0.55, dy = ddy[ni] * w * 0.55;
           const len = Math.hypot(dx, dy);
           if (len > maxO) { dx *= maxO / len; dy *= maxO / len; }
           tx = s.x + dx; ty = s.y + dy;
@@ -331,3 +354,8 @@ btnRec.onclick = () => {
 </script>
 </body>
 </html>
+```
+
+これで顔が主役、背景は顔の輪郭に沿って少しだけ付いてくる形になります。
+
+まだ背景が揺れるなら `maxO`（`faceSize * 0.12`）を下げ、`0.05` 以下にするとほぼ静止します。逆に顔の動きが小さいなら `maxD` を上げてください。
