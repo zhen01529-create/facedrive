@@ -16,9 +16,9 @@
   button:disabled{opacity:.4}
   #rec.on{background:#c33;border-color:#c33}
   #pvbtn.on{background:#357;border-color:#357}
-  #sliders{display:flex;gap:10px;flex:1 1 100%}
-  #sliders label{flex:1 1 0;min-width:0;display:flex;align-items:center;gap:4px;font-size:12px;color:#ccc}
-  #sliders input{flex:1 1 auto;min-width:50px}
+  #sliders{display:flex;gap:8px;flex:1 1 100%}
+  #sliders label{flex:1 1 0;min-width:0;display:flex;align-items:center;gap:3px;font-size:12px;color:#ccc}
+  #sliders input{flex:1 1 auto;min-width:40px}
   #hint{position:fixed;top:calc(10px + env(safe-area-inset-top));left:10px;right:10px;
        color:#aaa;font-size:12px;text-align:center;pointer-events:none}
 
@@ -68,8 +68,9 @@
   <button id="rec" disabled>録画</button>
   <div id="sliders">
     <label>頭<input id="hpow" type="range" min="0" max="300" value="100"></label>
-    <label>表情<input id="epow" type="range" min="0" max="300" value="130"></label>
-    <label>背景<input id="bpow" type="range" min="0" max="300" value="100"></label>
+    <label>表情<input id="epow" type="range" min="0" max="300" value="110"></label>
+    <label>髪<input id="hairpow" type="range" min="0" max="150" value="100"></label>
+    <label>首服<input id="bpow" type="range" min="0" max="200" value="100"></label>
   </div>
 </div>
 
@@ -78,30 +79,37 @@
 </script>
 
 <script type="module">
-import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
+import { FaceLandmarker, ImageSegmenter, FilesetResolver } from '@mediapipe/tasks-vision';
 
 const $ = id => document.getElementById(id);
 const cv = $('cv');
 const gl = cv.getContext('webgl2', { alpha:false, preserveDrawingBuffer:true });
 const hint = $('hint'), btnStart = $('start'), btnCalib = $('calib'), btnRec = $('rec'), pvbtn = $('pvbtn');
-const hpow = $('hpow'), epow = $('epow'), bpow = $('bpow');
+const hpow = $('hpow'), epow = $('epow'), hairpow = $('hairpow'), bpow = $('bpow');
 const pv = $('pv'), pvv = $('pvv'), pvo = $('pvo'), pvt = $('pvt'), pvs = $('pvs'), btnOk = $('ok');
 
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+const SEG_MODEL = 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite';
 const MAX = 1024;
+const GX = 44;                                  // 周囲メッシュの横方向の分割数
 const LIP = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95]; // 口の内側
+const OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,
+              148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];          // 顔の輪郭
 const TOL = 4;                                  // 正面の目安の許容角度（度）
 const MOUTH_MAX = 0.05;                         // 口の開きの目安（顔の高さ比）
 const HIST_N = 6;                               // 確定時に平均するフレーム数
+const S_MIN = 0.85, S_MAX = 1.25;               // 顔の拡大縮小の範囲（ズームの暴れ防止）
 const MIME = ['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp8','video/webm']
   .find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
 
-let landmarker, video = null, ts = 0, recorder = null, chunks = [];
+let landmarker, segmenter = null, video = null, ts = 0, recorder = null, chunks = [];
 let prog, vaoMesh, bufMesh, vaoMouth, bufMouth, srcTex, uUse, uCol;
 
 // 写真側
 let W = 0, H = 0, nF = 0, nV = 0, tris = null, idxCount = 0;
-let PP, Cp = [0,0], rP = 1, wG, vtx, TG, restOpen = 0, ready = false;
+let PP, Cp = [0,0], rP = 1, wA, wB, ewx, ewy, vtx, TG, restOpen = 0, ready = false;
+// wA = 頭に付いて動く度合い（髪・顔まわり）、wB = 首・服が付いて動く度合い
+// ewx/ewy = 表情の効き具合（顔の輪郭ではゼロ、内側ほど強い）
 // カメラ側
 let sm = null, base = null, bcx = 0, bcy = 0, den = 1, baseR = 1;
 let ang = null;                                 // 顔の向き {yaw, pitch, roll}（度、平滑化済み）
@@ -119,7 +127,17 @@ async function boot() {
     runningMode: 'VIDEO', numFaces: 1,
     outputFacialTransformationMatrixes: true
   });
-  hint.textContent = '写真を選んでください';
+  let segNote = '';
+  try {                                         // 髪などを分けるモデル（写真1枚に1回だけ使う）
+    segmenter = await ImageSegmenter.createFromOptions(fs, {
+      baseOptions: { modelAssetPath: SEG_MODEL, delegate: 'CPU' },
+      runningMode: 'IMAGE', outputCategoryMask: true, outputConfidenceMasks: false
+    });
+  } catch (e) {
+    segmenter = null;
+    segNote = '（髪の検出モデルが読めなかったので簡易モードです）';
+  }
+  hint.textContent = '写真を選んでください' + segNote;
 }
 boot().catch(e => hint.textContent = 'モデル読込失敗: ' + e.message);
 
@@ -169,10 +187,7 @@ function initGL() {
   gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
 }
 
-function uploadTexture(img) {
-  const c = document.createElement('canvas');
-  c.width = W; c.height = H;
-  c.getContext('2d').drawImage(img, 0, 0, W, H);
+function uploadTexture(c) {
   if (srcTex) gl.deleteTexture(srcTex);
   srcTex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, srcTex);
@@ -223,6 +238,20 @@ function triangulate(pts) {
   return T.filter(t => t.a < n && t.b < n && t.c < n);
 }
 
+/* ---------- 髪・体の分割 ---------- */
+// 戻り値：{ data, w, h }。分類は 0背景 1髪 2体の肌 3顔の肌 4服 5その他
+function segment(canvas) {
+  if (!segmenter) return null;
+  try {
+    const res = segmenter.segment(canvas);
+    const m = res.categoryMask;
+    const data = new Uint8Array(m.getAsUint8Array());
+    const out = { data, w: m.width, h: m.height };
+    if (m.close) m.close();
+    return out.data.length === out.w * out.h ? out : null;
+  } catch (e) { return null; }
+}
+
 /* ---------- 写真の読み込み ---------- */
 $('file').onchange = async e => {
   const f = e.target.files[0];
@@ -233,12 +262,21 @@ $('file').onchange = async e => {
     const img = new Image();
     img.src = URL.createObjectURL(f);
     await img.decode();
-    const r = landmarker.detectForVideo(img, ++ts);
-    const lm = r.faceLandmarks?.[0];
-    if (!lm) { hint.textContent = '顔が見つかりません'; return; }
 
     W = img.width; H = img.height;
     if (Math.max(W, H) > MAX) { const s = MAX / Math.max(W, H); W = Math.round(W*s); H = Math.round(H*s); }
+    const pic = document.createElement('canvas');   // 縮小した写真。顔検出・分割・テクスチャに共通で使う
+    pic.width = W; pic.height = H;
+    pic.getContext('2d').drawImage(img, 0, 0, W, H);
+
+    const r = landmarker.detectForVideo(pic, ++ts);
+    const lm = r.faceLandmarks?.[0];
+    if (!lm) { hint.textContent = '顔が見つかりません'; return; }
+
+    hint.textContent = '髪・体を検出中...';
+    await new Promise(res => setTimeout(res, 30));  // 表示を更新させる
+    const seg = segment(pic);
+
     nF = lm.length;
     PP = new Float32Array(nF * 2);
     Cp = [0, 0];
@@ -252,11 +290,24 @@ $('file').onchange = async e => {
     rP = Math.sqrt(q / nF);                       // 顔の大きさの基準（px）
     const chinY = PP[2*152+1];
 
+    // 表情の効き具合：輪郭では0、内側ほど強く。下半分は縦方向（顎の上下）だけ残す
+    ewx = new Float32Array(nF); ewy = new Float32Array(nF);
+    const noseY = PP[2*1+1], mouthY = PP[2*13+1];
+    for (let i = 0; i < nF; i++) {
+      let dm = 1e9;
+      for (const o of OVAL) dm = Math.min(dm, Math.hypot(PP[2*i] - PP[2*o], PP[2*i+1] - PP[2*o+1]));
+      const fade = sstep(0.0, 0.5, dm / rP);
+      const low = sstep(noseY, mouthY, PP[2*i+1]);
+      ewx[i] = fade;
+      ewy[i] = fade + (1 - fade) * low;
+    }
+
     // 周囲の格子点（顔に近すぎる点は除く）
     const pts = [];
     for (let i = 0; i < nF; i++) pts.push({ x: PP[2*i], y: PP[2*i+1] });
-    const gx = 30, gy = Math.max(8, Math.round(30 * H / W));
-    const wl = [];
+    const gx = GX, gy = Math.max(8, Math.round(GX * H / W));
+    const cell = W / gx;
+    const la = [], lb = [];
     for (let j = 0; j <= gy; j++) {
       for (let i = 0; i <= gx; i++) {
         const x = i * W / gx, y = j * H / gy;
@@ -264,12 +315,33 @@ $('file').onchange = async e => {
         for (let k = 0; k < nF; k++) d = Math.min(d, Math.hypot(x - PP[2*k], y - PP[2*k+1]));
         if (d < rP * 0.3) continue;
         if (y > chinY) d *= 1.5;                  // 首から下は追従を弱める
+        const dn = d / rP;
         const pin = i === 0 || j === 0 || i === gx || j === gy;
         pts.push({ x, y });
-        wl.push(pin ? 0 : 1 - sstep(0.3, 4.2, d / rP));
+        if (pin) { la.push(0); lb.push(0); continue; }
+
+        if (!seg) {                               // 検出なし：距離だけで決める（簡易モード）
+          la.push(0); lb.push(1 - sstep(0.3, 4.2, dn));
+          continue;
+        }
+        // 周囲7x7の分類を平均して、境目を広くなだらかにする（折れ・裂けの防止）
+        let a = 0, b = 0;
+        for (let u = -3; u <= 3; u++) {
+          for (let v = -3; v <= 3; v++) {
+            const sx = clamp(x + u * cell * 0.8, 0, W - 1), sy = clamp(y + v * cell * 0.8, 0, H - 1);
+            const cls = seg.data[Math.floor(sy / H * seg.h) * seg.w + Math.floor(sx / W * seg.w)];
+            if (cls === 1) a += 1 - 0.5 * sstep(2, 6, dn);              // 髪：頭と一体
+            else if (cls === 3) a += 1;                                  // 顔の肌：頭と一体
+            else if (cls === 5) a += 1 - sstep(0.5, 2.5, dn);            // その他（ヘアバンド等）
+            else if (cls === 2) b += 1 - sstep(0.3, 3.0, dn);            // 首・体の肌
+            else if (cls === 4) b += 0.35 * (1 - sstep(0.3, 3.0, dn));   // 服：少しだけ
+          }                                                              // 背景(0)は動かさない
+        }
+        la.push(a / 49); lb.push(b / 49);
       }
     }
-    wG = Float32Array.from(wl);
+    wA = Float32Array.from(la);
+    wB = Float32Array.from(lb);
     nV = pts.length;
     tris = triangulate(pts);
     if (tris.length < 100) { hint.textContent = 'メッシュ生成に失敗'; return; }
@@ -286,12 +358,12 @@ $('file').onchange = async e => {
     restOpen = Math.abs(PP[2*14+1] - PP[2*13+1]);
 
     if (!prog) initGL();
-    uploadTexture(img);
+    uploadTexture(pic);
     gl.bindVertexArray(vaoMesh);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
     ready = true;
     btnStart.disabled = false;
-    hint.textContent = `メッシュ ${tris.length} 面。開始を押してください`;
+    hint.textContent = (seg ? '髪を検出しました。' : '簡易モードです。') + `メッシュ ${tris.length} 面。開始を押してください`;
     draw(true);
   } catch (err) { hint.textContent = '失敗: ' + err.message; }
 };
@@ -505,7 +577,8 @@ function loop() {
 }
 
 function update() {
-  const hg = hpow.value / 100, eg = epow.value / 100, bg = bpow.value / 100;
+  const hg = hpow.value / 100, eg = epow.value / 100;
+  const hairg = hairpow.value / 100, bg = bpow.value / 100;
   let cx = 0, cy = 0;
   for (let i = 0; i < nF; i++) { cx += sm[2*i]; cy += sm[2*i+1]; }
   cx /= nF; cy /= nF;
@@ -518,7 +591,7 @@ function update() {
     re += sx*bx + sy*by;
     im += sy*bx - sx*by;
   }
-  const s = clamp(Math.hypot(re, im) / den, 0.55, 1.8);
+  const s = clamp(Math.hypot(re, im) / den, S_MIN, S_MAX);
   const th = clamp(Math.atan2(im, re), -1, 1);
   const zr = s * Math.cos(th), zi = s * Math.sin(th);
 
@@ -526,29 +599,32 @@ function update() {
   const f = rP / baseR;
   const s2 = 1 + (s - 1) * hg, th2 = th * hg;
   const zr2 = s2 * Math.cos(th2), zi2 = s2 * Math.sin(th2);
-  const Tx = f * hg * (cx - bcx), Ty = f * hg * (cy - bcy);
+  let Tx = f * hg * (cx - bcx), Ty = f * hg * (cy - bcy);
+  const tl = Math.hypot(Tx, Ty), tm = rP * 1.0;   // 顔の移動は顔の大きさ程度まで
+  if (tl > tm) { Tx *= tm / tl; Ty *= tm / tl; }
   const pose = (px, py) => {
     const dx = px - Cp[0], dy = py - Cp[1];
     return [Cp[0] + Tx + zr2*dx - zi2*dy, Cp[1] + Ty + zi2*dx + zr2*dy];
   };
 
-  const maxE = rP * 1.2, zz = zr*zr + zi*zi;
+  const maxE = rP * 0.6, zz = zr*zr + zi*zi;
   for (let i = 0; i < nF; i++) {
     const sx = sm[2*i] - cx, sy = sm[2*i+1] - cy;
     const bx = base[2*i] - bcx, by = base[2*i+1] - bcy;
     // 表情＝姿勢を引いた残り（頭の座標系に戻す）
     const rx = sx - (zr*bx - zi*by), ry = sy - (zi*bx + zr*by);
     const hx = (rx*zr + ry*zi) / zz, hy = (ry*zr - rx*zi) / zz;
-    let ex = (zr2*hx - zi2*hy) * f * eg, ey = (zi2*hx + zr2*hy) * f * eg;
+    let ex = (zr2*hx - zi2*hy) * f * eg * ewx[i];   // 輪郭では0 → 隣の髪と食い違わない
+    let ey = (zi2*hx + zr2*hy) * f * eg * ewy[i];
     const l = Math.hypot(ex, ey);
     if (l > maxE) { ex *= maxE / l; ey *= maxE / l; }
     const [qx, qy] = pose(PP[2*i], PP[2*i+1]);
     TG[2*i] = qx + ex; TG[2*i+1] = qy + ey;
     vtx[4*i+2] = TG[2*i] / W; vtx[4*i+3] = TG[2*i+1] / H;
   }
-  for (let g = 0; nF + g < nV; g++) {             // 背景・髪・首は距離で減衰して追従
+  for (let g = 0; nF + g < nV; g++) {             // 髪・首・服は、分類に応じた度合いで頭に付いて動く
     const i = nF + g, px = vtx[4*i] * W, py = vtx[4*i+1] * H;
-    const w = wG[g] * bg;
+    const w = clamp(wA[g] * hairg + wB[g] * bg, 0, 1.2);
     if (w <= 0) { vtx[4*i+2] = vtx[4*i]; vtx[4*i+3] = vtx[4*i+1]; continue; }
     const [qx, qy] = pose(px, py);
     vtx[4*i+2] = (px + (qx - px) * w) / W;
