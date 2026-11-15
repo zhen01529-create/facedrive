@@ -6,14 +6,18 @@
 <title>face drive</title>
 <style>
   html,body{margin:0;background:#111;color:#eee;font:14px/1.4 -apple-system,sans-serif;overflow:hidden}
-  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  #stage{position:fixed;left:0;right:0;top:0;bottom:130px;display:flex;align-items:center;justify-content:center}
   canvas{max-width:100%;max-height:100%}
   #bar{position:fixed;left:0;right:0;bottom:0;padding:10px calc(10px + env(safe-area-inset-bottom));
-       display:flex;gap:8px;background:#000c;backdrop-filter:blur(8px)}
+       display:flex;flex-wrap:wrap;gap:8px;align-items:center;background:#000c;backdrop-filter:blur(8px)}
+  #file{flex:0 1 120px;min-width:0;overflow:hidden;white-space:nowrap}
   button,input[type=file]::file-selector-button{font:inherit;padding:10px 14px;border-radius:10px;
        border:1px solid #444;background:#222;color:#eee}
   button:disabled{opacity:.4}
   #rec.on{background:#c33;border-color:#c33}
+  #sliders{display:flex;gap:10px;flex:1 1 100%}
+  #sliders label{flex:1 1 0;min-width:0;display:flex;align-items:center;gap:4px;font-size:12px;color:#ccc}
+  #sliders input{flex:1 1 auto;min-width:50px}
   #hint{position:fixed;top:calc(10px + env(safe-area-inset-top));left:10px;right:10px;
        color:#aaa;font-size:12px;text-align:center;pointer-events:none}
 </style>
@@ -24,7 +28,13 @@
 <div id="bar">
   <input id="file" type="file" accept="image/*">
   <button id="start" disabled>開始</button>
+  <button id="calib" disabled>基準</button>
   <button id="rec" disabled>録画</button>
+  <div id="sliders">
+    <label>頭<input id="hpow" type="range" min="0" max="300" value="100"></label>
+    <label>表情<input id="epow" type="range" min="0" max="300" value="130"></label>
+    <label>背景<input id="bpow" type="range" min="0" max="300" value="100"></label>
+  </div>
 </div>
 
 <script type="importmap">
@@ -34,20 +44,29 @@
 <script type="module">
 import { FaceLandmarker, FilesetResolver } from '@mediapipe/tasks-vision';
 
-const cv = document.getElementById('cv');
+const $ = id => document.getElementById(id);
+const cv = $('cv');
 const gl = cv.getContext('webgl2', { alpha:false, preserveDrawingBuffer:true });
-const hint = document.getElementById('hint');
-const btnStart = document.getElementById('start');
-const btnRec = document.getElementById('rec');
-
-let landmarker, srcPts = null, srcTex = null, tris = [], buf = null, prog = null;
-let video = null, smooth = null, recorder = null, chunks = [], ts = 0;
+const hint = $('hint'), btnStart = $('start'), btnCalib = $('calib'), btnRec = $('rec');
+const hpow = $('hpow'), epow = $('epow'), bpow = $('bpow');
 
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 const MAX = 1024;
-
+const LIP = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95]; // 口の内側
 const MIME = ['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp8','video/webm']
   .find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+
+let landmarker, video = null, ts = 0, recorder = null, chunks = [];
+let prog, vaoMesh, bufMesh, vaoMouth, bufMouth, srcTex, uUse, uCol;
+
+// 写真側
+let W = 0, H = 0, nF = 0, nV = 0, tris = null, idxCount = 0;
+let PP, Cp = [0,0], rP = 1, wG, vtx, TG, restOpen = 0, ready = false;
+// カメラ側
+let sm = null, base = null, baseAcc = null, baseN = 0, bC = [0,0], bcx, bcy, den = 1, baseR = 1;
+
+const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x-a)/(b-a))); return t*t*(3-2*t); };
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
 async function boot() {
   const fs = await FilesetResolver.forVisionTasks(
@@ -60,9 +79,11 @@ async function boot() {
 }
 boot().catch(e => hint.textContent = 'モデル読込失敗: ' + e.message);
 
+/* ---------- WebGL ---------- */
 function initGL() {
   const vs = `#version 300 es
-  in vec2 aRest, aTarget;
+  layout(location=0) in vec2 aRest;
+  layout(location=1) in vec2 aTarget;
   out vec2 vUV;
   void main(){
     vUV = aRest;
@@ -72,158 +93,321 @@ function initGL() {
   precision highp float;
   in vec2 vUV; out vec4 o;
   uniform sampler2D uTex;
-  void main(){ o = texture(uTex, vUV); }`;
-  const mk = (t, s) => { const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh);
-    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh)); return sh; };
+  uniform float uUse;
+  uniform vec4 uCol;
+  void main(){ o = uUse > 0.5 ? uCol : texture(uTex, vUV); }`;
+  const mk = (t, s) => {
+    const sh = gl.createShader(t);
+    gl.shaderSource(sh, s); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+    return sh;
+  };
   prog = gl.createProgram();
   gl.attachShader(prog, mk(gl.VERTEX_SHADER, vs));
   gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, fs));
   gl.linkProgram(prog);
   gl.useProgram(prog);
-  buf = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  const aR = gl.getAttribLocation(prog, 'aRest'), aT = gl.getAttribLocation(prog, 'aTarget');
-  gl.enableVertexAttribArray(aR); gl.enableVertexAttribArray(aT);
-  gl.vertexAttribPointer(aR, 2, gl.FLOAT, false, 16, 0);
-  gl.vertexAttribPointer(aT, 2, gl.FLOAT, false, 16, 8);
+  uUse = gl.getUniformLocation(prog, 'uUse');
+  uCol = gl.getUniformLocation(prog, 'uCol');
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0, 0, 0, 1);
+
+  vaoMesh = gl.createVertexArray(); gl.bindVertexArray(vaoMesh);
+  bufMesh = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bufMesh);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+
+  vaoMouth = gl.createVertexArray(); gl.bindVertexArray(vaoMouth);
+  bufMouth = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bufMouth);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
 }
 
 function uploadTexture(img) {
-  let w = img.width, h = img.height;
-  if (Math.max(w, h) > MAX) { const s = MAX / Math.max(w, h); w = Math.round(w*s); h = Math.round(h*s); }
   const c = document.createElement('canvas');
-  c.width = w; c.height = h;
-  c.getContext('2d').drawImage(img, 0, 0, w, h);
+  c.width = W; c.height = H;
+  c.getContext('2d').drawImage(img, 0, 0, W, H);
+  if (srcTex) gl.deleteTexture(srcTex);
   srcTex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, srcTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  cv.width = w; cv.height = h;
+  cv.width = W; cv.height = H;
 }
 
-function circ(P, t) {
-  const {x:ax,y:ay} = P[t.a], {x:bx,y:by} = P[t.b], {x:cx,y:cy} = P[t.c];
-  const d = 2 * (ax*(by-cy) + bx*(cy-ay) + cx*(ay-by));
-  if (Math.abs(d) < 1e-12) return { x:0, y:0, r2: Infinity };
-  const ux = ((ax*ax+ay*ay)*(by-cy) + (bx*bx+by*by)*(cy-ay) + (cx*cx+cy*cy)*(ay-by)) / d;
-  const uy = ((ax*ax+ay*ay)*(cx-bx) + (bx*bx+by*by)*(ax-cx) + (cx*cx+cy*cy)*(bx-ax)) / d;
-  return { x:ux, y:uy, r2:(ax-ux)**2 + (ay-uy)**2 };
+/* ---------- Delaunay ---------- */
+function mkTri(P, a, b, c) {
+  const A = P[a], B = P[b], C = P[c];
+  const d = 2 * (A.x*(B.y-C.y) + B.x*(C.y-A.y) + C.x*(A.y-B.y));
+  if (Math.abs(d) < 1e-9) return { a, b, c, cx:0, cy:0, r2:Infinity };
+  const a2 = A.x*A.x + A.y*A.y, b2 = B.x*B.x + B.y*B.y, c2 = C.x*C.x + C.y*C.y;
+  const cx = (a2*(B.y-C.y) + b2*(C.y-A.y) + c2*(A.y-B.y)) / d;
+  const cy = (a2*(C.x-B.x) + b2*(A.x-C.x) + c2*(B.x-A.x)) / d;
+  return { a, b, c, cx, cy, r2:(A.x-cx)**2 + (A.y-cy)**2 };
 }
 
 function triangulate(pts) {
   const n = pts.length;
-  let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9;
-  for (const p of pts) { mnx=Math.min(mnx,p.x); mny=Math.min(mny,p.y); mxx=Math.max(mxx,p.x); mxy=Math.max(mxy,p.y); }
-  const d = Math.max(mxx-mnx, mxy-mny) * 10, cx=(mnx+mxx)/2, cy=(mny+mxy)/2;
-  const P = pts.concat([{x:cx-d,y:cy-d},{x:cx,y:cy+d},{x:cx+d,y:cy-d}]);
-  let t = [{a:n,b:n+1,c:n+2}];
-  for (let i = 0; i < n; i++) {
-    const p = P[i], bad = [], keep = [];
-    for (const tr of t) {
-      const c = circ(P, tr);
-      if ((p.x-c.x)**2 + (p.y-c.y)**2 < c.r2) bad.push(tr); else keep.push(tr);
-    }
-    const edge = new Map();
-    for (const tr of bad) for (const [u,v] of [[tr.a,tr.b],[tr.b,tr.c],[tr.c,tr.a]]) {
-      const k = u < v ? u+','+v : v+','+u;
-      edge.set(k, (edge.get(k) || 0) + 1);
-    }
-    t = keep;
-    for (const [k, c] of edge) if (c === 1) { const [u,v] = k.split(',').map(Number); t.push({a:u,b:v,c:i}); }
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const p of pts) {
+    x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y);
+    x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y);
   }
-  const span = Math.max(mxx-mnx, mxy-mny);
-  return t.filter(tr => {
-    if (tr.a>=n || tr.b>=n || tr.c>=n) return false;
-    const A=P[tr.a],B=P[tr.b],C=P[tr.c];
-    const e = Math.max(Math.hypot(A.x-B.x,A.y-B.y), Math.hypot(B.x-C.x,B.y-C.y), Math.hypot(C.x-A.x,C.y-A.y));
-    const area = Math.abs((B.x-A.x)*(C.y-A.y) - (C.x-A.x)*(B.y-A.y)) / 2;
-    return e < span * 0.32 && area > 1e-7;
-  });
+  const d = Math.max(x1-x0, y1-y0) * 100, mx = (x0+x1)/2, my = (y0+y1)/2;
+  const P = pts.map(p => ({ x: p.x + Math.random()*1e-3, y: p.y + Math.random()*1e-3 }));
+  P.push({x:mx-d, y:my-d}, {x:mx, y:my+d}, {x:mx+d, y:my-d});
+  let T = [mkTri(P, n, n+1, n+2)];
+  for (let i = 0; i < n; i++) {
+    const p = P[i], keep = [], edges = new Map();
+    for (const t of T) {
+      if ((p.x-t.cx)**2 + (p.y-t.cy)**2 < t.r2) {
+        for (const [u, v] of [[t.a,t.b],[t.b,t.c],[t.c,t.a]]) {
+          const k = u < v ? u+','+v : v+','+u;
+          edges.set(k, (edges.get(k) || 0) + 1);
+        }
+      } else keep.push(t);
+    }
+    T = keep;
+    for (const [k, c] of edges) {
+      if (c === 1) { const [u, v] = k.split(',').map(Number); T.push(mkTri(P, u, v, i)); }
+    }
+  }
+  return T.filter(t => t.a < n && t.b < n && t.c < n);
 }
 
-document.getElementById('file').onchange = async e => {
-  const f = e.target.files[0]; if (!f) return;
+/* ---------- 写真の読み込み ---------- */
+$('file').onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  ready = false;
   hint.textContent = '顔を検出中...';
   try {
     const img = new Image();
     img.src = URL.createObjectURL(f);
     await img.decode();
     const r = landmarker.detectForVideo(img, ++ts);
-    if (!r.faceLandmarks?.[0]) { hint.textContent = '顔が見つかりません'; return; }
-    srcPts = r.faceLandmarks[0].map(p => ({ x: p.x, y: p.y }));
-    smooth = srcPts.map(p => ({ ...p }));
-    tris = triangulate(srcPts);
-    if (tris.length < 50) { hint.textContent = 'メッシュ生成に失敗'; return; }
+    const lm = r.faceLandmarks?.[0];
+    if (!lm) { hint.textContent = '顔が見つかりません'; return; }
+
+    W = img.width; H = img.height;
+    if (Math.max(W, H) > MAX) { const s = MAX / Math.max(W, H); W = Math.round(W*s); H = Math.round(H*s); }
+    nF = lm.length;
+    PP = new Float32Array(nF * 2);
+    Cp = [0, 0];
+    for (let i = 0; i < nF; i++) {
+      PP[2*i] = lm[i].x * W; PP[2*i+1] = lm[i].y * H;
+      Cp[0] += PP[2*i]; Cp[1] += PP[2*i+1];
+    }
+    Cp[0] /= nF; Cp[1] /= nF;
+    let q = 0;
+    for (let i = 0; i < nF; i++) q += (PP[2*i]-Cp[0])**2 + (PP[2*i+1]-Cp[1])**2;
+    rP = Math.sqrt(q / nF);                       // 顔の大きさの基準（px）
+    const chinY = PP[2*152+1];
+
+    // 周囲の格子点（顔に近すぎる点は除く）
+    const pts = [];
+    for (let i = 0; i < nF; i++) pts.push({ x: PP[2*i], y: PP[2*i+1] });
+    const gx = 30, gy = Math.max(8, Math.round(30 * H / W));
+    const wl = [];
+    for (let j = 0; j <= gy; j++) {
+      for (let i = 0; i <= gx; i++) {
+        const x = i * W / gx, y = j * H / gy;
+        let d = 1e9;
+        for (let k = 0; k < nF; k++) d = Math.min(d, Math.hypot(x - PP[2*k], y - PP[2*k+1]));
+        if (d < rP * 0.3) continue;
+        if (y > chinY) d *= 1.5;                  // 首から下は追従を弱める
+        const pin = i === 0 || j === 0 || i === gx || j === gy;
+        pts.push({ x, y });
+        wl.push(pin ? 0 : 1 - sstep(0.3, 4.2, d / rP));
+      }
+    }
+    wG = Float32Array.from(wl);
+    nV = pts.length;
+    tris = triangulate(pts);
+    if (tris.length < 100) { hint.textContent = 'メッシュ生成に失敗'; return; }
+
+    const idx = new Uint16Array(tris.length * 3);
+    tris.forEach((t, i) => { idx[3*i] = t.a; idx[3*i+1] = t.b; idx[3*i+2] = t.c; });
+    idxCount = idx.length;
+    vtx = new Float32Array(nV * 4);
+    for (let i = 0; i < nV; i++) {
+      vtx[4*i] = pts[i].x / W; vtx[4*i+1] = pts[i].y / H;
+      vtx[4*i+2] = vtx[4*i]; vtx[4*i+3] = vtx[4*i+1];
+    }
+    TG = new Float32Array(nF * 2);
+    restOpen = Math.abs(PP[2*14+1] - PP[2*13+1]);
+
     if (!prog) initGL();
     uploadTexture(img);
+    gl.bindVertexArray(vaoMesh);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+    ready = true;
     btnStart.disabled = false;
     hint.textContent = `メッシュ ${tris.length} 面。開始を押してください`;
+    draw(true);
   } catch (err) { hint.textContent = '失敗: ' + err.message; }
 };
 
+/* ---------- カメラ ---------- */
 btnStart.onclick = async () => {
   try {
     if (!video) {
       video = document.createElement('video');
       video.playsInline = true; video.muted = true;
       const st = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: 480, height: 360 }, audio: false });
+        video: { facingMode: 'user', width: 640, height: 480 }, audio: false });
       video.srcObject = st;
       await video.play();
+      loop();
     }
-    btnRec.disabled = false;
-    hint.textContent = '';
-    loop();
+    btnRec.disabled = false; btnCalib.disabled = false;
+    resetBase();
   } catch (err) { hint.textContent = 'カメラ不可: ' + err.message; }
 };
+btnCalib.onclick = resetBase;
 
-const box = pts => {
-  let a=1e9,b=1e9,c=-1e9,d=-1e9;
-  for (const p of pts) { a=Math.min(a,p.x); b=Math.min(b,p.y); c=Math.max(c,p.x); d=Math.max(d,p.y); }
-  return { cx:(a+c)/2, cy:(b+d)/2, h:d-b };
-};
+function resetBase() {
+  base = null; baseAcc = null; baseN = 0; sm = null;
+  hint.textContent = '正面を向いて、無表情のまま少し待ってください';
+}
 
+function setBase(acc, n) {
+  base = new Float32Array(acc.length);
+  bcx = 0; bcy = 0;
+  for (let i = 0; i < acc.length; i++) base[i] = acc[i] / n;
+  const m = base.length / 2;
+  for (let i = 0; i < m; i++) { bcx += base[2*i]; bcy += base[2*i+1]; }
+  bcx /= m; bcy /= m;
+  den = 0;
+  for (let i = 0; i < m; i++) den += (base[2*i]-bcx)**2 + (base[2*i+1]-bcy)**2;
+  baseR = Math.sqrt(den / m);
+  hint.textContent = '';
+}
+
+/* ---------- メインループ ---------- */
 function loop() {
   requestAnimationFrame(loop);
+  if (!ready) return;
   ts = Math.max(performance.now(), ts + 1);
   const r = landmarker.detectForVideo(video, ts);
   const cam = r.faceLandmarks?.[0];
-  if (!cam) return;
+  const vw = video.videoWidth, vh = video.videoHeight;
 
-  for (let i = 0; i < smooth.length; i++) {
-    smooth[i].x += (1 - cam[i].x - smooth[i].x) * 0.5;
-    smooth[i].y += (cam[i].y - smooth[i].y) * 0.5;
-  }
-
-  const sb = box(srcPts), cb = box(smooth);
-  const k = sb.h / Math.max(cb.h, 1e-4);
-
-  const arr = new Float32Array(tris.length * 3 * 4);
-  let o = 0;
-  for (const tr of tris) {
-    const gx = (srcPts[tr.a].x + srcPts[tr.b].x + srcPts[tr.c].x) / 3;
-    const gy = (srcPts[tr.a].y + srcPts[tr.b].y + srcPts[tr.c].y) / 3;
-    for (const id of [tr.a, tr.b, tr.c]) {
-      const s = srcPts[id], m = smooth[id];
-      const tx = sb.cx + (m.x - cb.cx) * k;
-      const ty = sb.cy + (m.y - cb.cy) * k;
-      const dx = tx - gx, dy = ty - gy, len = Math.hypot(dx, dy) || 1;
-      arr[o++] = s.x; arr[o++] = s.y;
-      arr[o++] = tx + dx / len * 0.0015;
-      arr[o++] = ty + dy / len * 0.0015;
+  if (cam && cam.length >= nF) {
+    if (!sm) sm = new Float32Array(nF * 2).map((_, i) => 0);
+    const first = sm.every(v => v === 0);
+    for (let i = 0; i < nF; i++) {
+      const x = (1 - cam[i].x) * vw, y = cam[i].y * vh;
+      if (first) { sm[2*i] = x; sm[2*i+1] = y; }
+      else { sm[2*i] += (x - sm[2*i]) * 0.5; sm[2*i+1] += (y - sm[2*i+1]) * 0.5; }
     }
   }
+  if (!sm) { draw(true); return; }
 
-  gl.viewport(0, 0, cv.width, cv.height);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  gl.bufferData(gl.ARRAY_BUFFER, arr, gl.DYNAMIC_DRAW);
-  gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, srcTex);
-  gl.drawArrays(gl.TRIANGLES, 0, tris.length * 3);
+  if (!base) {                                    // 基準を数フレーム平均して作る
+    if (!baseAcc) { baseAcc = new Float32Array(nF * 2); baseN = 0; }
+    for (let i = 0; i < sm.length; i++) baseAcc[i] += sm[i];
+    if (++baseN >= 10) setBase(baseAcc, baseN);
+    draw(true);
+    return;
+  }
+  update();
+  draw(false);
 }
 
+function update() {
+  const hg = hpow.value / 100, eg = epow.value / 100, bg = bpow.value / 100;
+  let cx = 0, cy = 0;
+  for (let i = 0; i < nF; i++) { cx += sm[2*i]; cy += sm[2*i+1]; }
+  cx /= nF; cy /= nF;
+
+  // 基準→現在の 回転＋拡大縮小 を最小二乗で求める
+  let re = 0, im = 0;
+  for (let i = 0; i < nF; i++) {
+    const sx = sm[2*i] - cx, sy = sm[2*i+1] - cy;
+    const bx = base[2*i] - bcx, by = base[2*i+1] - bcy;
+    re += sx*bx + sy*by;
+    im += sy*bx - sx*by;
+  }
+  let s = clamp(Math.hypot(re, im) / den, 0.55, 1.8);
+  const th = clamp(Math.atan2(im, re), -1, 1);
+  const zr = s * Math.cos(th), zi = s * Math.sin(th);
+
+  // 頭の動き（ゲイン付き）
+  const f = rP / baseR;
+  const s2 = 1 + (s - 1) * hg, th2 = th * hg;
+  const zr2 = s2 * Math.cos(th2), zi2 = s2 * Math.sin(th2);
+  const Tx = f * hg * (cx - bcx), Ty = f * hg * (cy - bcy);
+  const pose = (px, py) => {
+    const dx = px - Cp[0], dy = py - Cp[1];
+    return [Cp[0] + Tx + zr2*dx - zi2*dy, Cp[1] + Ty + zi2*dx + zr2*dy];
+  };
+
+  const maxE = rP * 1.2, zz = zr*zr + zi*zi;
+  for (let i = 0; i < nF; i++) {
+    const sx = sm[2*i] - cx, sy = sm[2*i+1] - cy;
+    const bx = base[2*i] - bcx, by = base[2*i+1] - bcy;
+    // 表情＝姿勢を引いた残り（頭の座標系に戻す）
+    const rx = sx - (zr*bx - zi*by), ry = sy - (zi*bx + zr*by);
+    const hx = (rx*zr + ry*zi) / zz, hy = (ry*zr - rx*zi) / zz;
+    let ex = (zr2*hx - zi2*hy) * f * eg, ey = (zi2*hx + zr2*hy) * f * eg;
+    const l = Math.hypot(ex, ey);
+    if (l > maxE) { ex *= maxE / l; ey *= maxE / l; }
+    const [qx, qy] = pose(PP[2*i], PP[2*i+1]);
+    TG[2*i] = qx + ex; TG[2*i+1] = qy + ey;
+    vtx[4*i+2] = TG[2*i] / W; vtx[4*i+3] = TG[2*i+1] / H;
+  }
+  for (let g = 0; nF + g < nV; g++) {             // 背景・髪・首は距離で減衰して追従
+    const i = nF + g, px = vtx[4*i] * W, py = vtx[4*i+1] * H;
+    const w = wG[g] * bg;
+    if (w <= 0) { vtx[4*i+2] = vtx[4*i]; vtx[4*i+3] = vtx[4*i+1]; continue; }
+    const [qx, qy] = pose(px, py);
+    vtx[4*i+2] = (px + (qx - px) * w) / W;
+    vtx[4*i+3] = (py + (qy - py) * w) / H;
+  }
+}
+
+function draw(rest) {
+  if (!prog || !srcTex) return;
+  if (rest) for (let i = 0; i < nV; i++) { vtx[4*i+2] = vtx[4*i]; vtx[4*i+3] = vtx[4*i+1]; }
+  gl.viewport(0, 0, cv.width, cv.height);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  gl.bindVertexArray(vaoMesh);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufMesh);
+  gl.bufferData(gl.ARRAY_BUFFER, vtx, gl.DYNAMIC_DRAW);
+  gl.uniform1f(uUse, 0);
+  gl.drawElements(gl.TRIANGLES, idxCount, gl.UNSIGNED_SHORT, 0);
+
+  if (rest) return;
+  // 口を開けたときだけ、口の中を暗く塗る
+  const open = Math.abs(TG[2*14+1] - TG[2*13+1]);
+  const a = clamp((open - restOpen) / (rP * 0.1), 0, 1);
+  if (a <= 0.01) return;
+  let mx = 0, my = 0;
+  for (const k of LIP) { mx += TG[2*k]; my += TG[2*k+1]; }
+  mx /= LIP.length; my /= LIP.length;
+  const m = new Float32Array(LIP.length * 3 * 4);
+  let o = 0;
+  const put = (x, y) => { m[o++] = x/W; m[o++] = y/H; m[o++] = x/W; m[o++] = y/H; };
+  for (let k = 0; k < LIP.length; k++) {
+    const p = LIP[k], q = LIP[(k+1) % LIP.length];
+    put(mx, my); put(TG[2*p], TG[2*p+1]); put(TG[2*q], TG[2*q+1]);
+  }
+  gl.bindVertexArray(vaoMouth);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufMouth);
+  gl.bufferData(gl.ARRAY_BUFFER, m, gl.DYNAMIC_DRAW);
+  gl.uniform1f(uUse, 1);
+  gl.uniform4f(uCol, 0.17, 0.04, 0.06, a);
+  gl.drawArrays(gl.TRIANGLES, 0, LIP.length * 3);
+}
+
+/* ---------- 録画 ---------- */
 btnRec.onclick = () => {
   if (recorder) { recorder.stop(); return; }
   if (!MIME) { hint.textContent = 'この端末は録画非対応'; return; }
