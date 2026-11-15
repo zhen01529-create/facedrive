@@ -61,7 +61,8 @@ let angS = 0, sclS = 1;
 
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 const MAX = 1024;
-const POSE_G = 1.5;   // 頭の動きの倍率（固定）
+const POSE_G = 1.5;
+const EXPR_G = 3.0;
 
 const MIME = ['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp8','video/webm']
   .find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
@@ -251,8 +252,8 @@ function loop() {
 
   const sb = box(srcPts);
   const faceSize = Math.max(sb.w, sb.h) || 1;
-  const bgain = bpow.value / 100;   // 背景
-  const egain = epow.value / 100;   // 表情
+  const bgain = bpow.value / 100;
+  const egain = epow.value / 100;
   const maxP = faceSize * 0.60;
   const maxE = faceSize * 0.38 * Math.max(1, egain);
   const maxO = faceSize * 0.45 * Math.max(1, bgain);
@@ -273,7 +274,7 @@ function loop() {
   if (!rot.checked) ang = 0;
   const scl = Math.hypot(re, im) / Math.max(den, 1e-9);
   angS += (ang - angS) * 0.55;
-  sclS += (Math.min(1.8, Math.max(0.5, scl)) - sclS) * 0.55;
+  sclS += (Math.min(1.6, Math.max(0.65, scl)) - sclS) * 0.55;
 
   const cs = Math.cos(angS), sn = Math.sin(angS);
   const poseOf = (px, py) => {
@@ -291,8 +292,8 @@ function loop() {
 
   for (let i = 0; i < nFace; i++) {
     const s = srcPts[i];
-    const [qx, qy] = poseOf(s.x, s.y);
-    const [rx, ry] = poseOf(smooth[i].x, smooth[i].y);
+    const [qx, qy] = poseOf(s.x, s.y);                 // 写真点の姿勢後
+    const [rx, ry] = poseOf(smooth[i].x, smooth[i].y); // カメラ点の姿勢後
 
     let px = ((qx - s.x) + t0x) * POSE_G;
     let py = ((qy - s.y) + t0y) * POSE_G;
@@ -300,7 +301,8 @@ function loop() {
     if (pl > maxP) { px *= maxP / pl; py *= maxP / pl; }
     dpx[i] = px; dpy[i] = py;
 
-    let ex = (rx - s.x) * 3.0 * egain, ey = (ry - s.y) * 3.0 * egain;
+    // 姿勢を差し引いた残差だけが表情
+    let ex = (rx - qx) * EXPR_G * egain, ey = (ry - qy) * EXPR_G * egain;
     const el = Math.hypot(ex, ey);
     if (el > maxE) { ex *= maxE / el; ey *= maxE / el; }
     dex[i] = ex; dey[i] = ey;
