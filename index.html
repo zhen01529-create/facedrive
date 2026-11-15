@@ -33,7 +33,7 @@
   <label><input id="rot" type="checkbox" checked>傾き</label>
   <div id="sliders">
     <label>背景<input id="bpow" type="range" min="0" max="300" value="100"></label>
-    <label>表情<input id="epow" type="range" min="0" max="300" value="140"></label>
+    <label>表情<input id="epow" type="range" min="0" max="300" value="100"></label>
   </div>
 </div>
 
@@ -54,15 +54,14 @@ const epow = document.getElementById('epow');
 const rot = document.getElementById('rot');
 
 let landmarker, srcPts = null, allPts = null, nFace = 0, near = null;
-let scx = 0, scy = 0;
+let scx = 0, scy = 0, srcAng = 0;
 let srcTex = null, tris = [], buf = null, prog = null;
 let video = null, smooth = null, recorder = null, chunks = [], ts = 0;
-let angS = 0, sclS = 1;
+let angS = 0;
 
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 const MAX = 1024;
-const POSE_G = 1.5;
-const EXPR_G = 3.0;
+const EA = 33, EB = 263;   // 目の外側の角（傾きの基準）
 
 const MIME = ['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp8','video/webm']
   .find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
@@ -202,6 +201,7 @@ document.getElementById('file').onchange = async e => {
     scx = 0; scy = 0;
     for (const p of srcPts) { scx += p.x; scy += p.y; }
     scx /= nFace; scy /= nFace;
+    srcAng = Math.atan2(srcPts[EB].y - srcPts[EA].y, srcPts[EB].x - srcPts[EA].x);
     allPts = srcPts.concat(makeFrame(srcPts));
     near = new Uint16Array(allPts.length - nFace);
     for (let i = nFace; i < allPts.length; i++) {
@@ -250,63 +250,44 @@ function loop() {
     }
   }
 
-  const sb = box(srcPts);
+  const sb = box(srcPts), cb = box(smooth);
   const faceSize = Math.max(sb.w, sb.h) || 1;
+  const k = Math.min(3, Math.max(0.4, sb.h / Math.max(cb.h, 1e-4)));
   const bgain = bpow.value / 100;
   const egain = epow.value / 100;
-  const maxP = faceSize * 0.60;
-  const maxE = faceSize * 0.38 * Math.max(1, egain);
-  const maxO = faceSize * 0.45 * Math.max(1, bgain);
+  const maxD = faceSize * 0.60;
 
-  let ccx = 0, ccy = 0;
-  for (let i = 0; i < nFace; i++) { ccx += smooth[i].x; ccy += smooth[i].y; }
-  ccx /= nFace; ccy /= nFace;
-
-  let re = 0, im = 0, den = 0;
-  for (let i = 0; i < nFace; i++) {
-    const ax = smooth[i].x - ccx, ay = smooth[i].y - ccy;
-    const bx = srcPts[i].x - scx, by = srcPts[i].y - scy;
-    re += bx*ax + by*ay;
-    im += by*ax - bx*ay;
-    den += ax*ax + ay*ay;
+  // 傾き（目の線の角度差）
+  let ang = 0;
+  if (rot.checked) {
+    const a = smooth[EA], b = smooth[EB];
+    ang = Math.atan2(b.y - a.y, b.x - a.x) - srcAng;
+    ang = Math.max(-0.7, Math.min(0.7, ang));
   }
-  let ang = Math.atan2(im, re);
-  if (!rot.checked) ang = 0;
-  const scl = Math.hypot(re, im) / Math.max(den, 1e-9);
-  angS += (ang - angS) * 0.55;
-  sclS += (Math.min(1.6, Math.max(0.65, scl)) - sclS) * 0.55;
-
+  angS += (ang - angS) * 0.5;
   const cs = Math.cos(angS), sn = Math.sin(angS);
-  const poseOf = (px, py) => {
-    const ax = (px - ccx) * sclS, ay = (py - ccy) * sclS;
-    return [scx + cs*ax - sn*ay, scy + sn*ax + cs*ay];
-  };
 
-  const gx0 = (ccx - scx) * 0.5, gy0 = (ccy - scy) * 0.5;
-  const gl0 = Math.hypot(gx0, gy0), gmax = faceSize * 0.18;
-  const t0x = gl0 > gmax ? gx0 * gmax / gl0 : gx0;
-  const t0y = gl0 > gmax ? gy0 * gmax / gl0 : gy0;
-
-  const dpx = new Float32Array(nFace), dpy = new Float32Array(nFace);
-  const dex = new Float32Array(nFace), dey = new Float32Array(nFace);
-
+  const ddx = new Float32Array(nFace), ddy = new Float32Array(nFace);
   for (let i = 0; i < nFace; i++) {
-    const s = srcPts[i];
-    const [qx, qy] = poseOf(s.x, s.y);                 // 写真点の姿勢後
-    const [rx, ry] = poseOf(smooth[i].x, smooth[i].y); // カメラ点の姿勢後
-
-    let px = ((qx - s.x) + t0x) * POSE_G;
-    let py = ((qy - s.y) + t0y) * POSE_G;
-    const pl = Math.hypot(px, py);
-    if (pl > maxP) { px *= maxP / pl; py *= maxP / pl; }
-    dpx[i] = px; dpy[i] = py;
-
-    // 姿勢を差し引いた残差だけが表情
-    let ex = (rx - qx) * EXPR_G * egain, ey = (ry - qy) * EXPR_G * egain;
-    const el = Math.hypot(ex, ey);
-    if (el > maxE) { ex *= maxE / el; ey *= maxE / el; }
-    dex[i] = ex; dey[i] = ey;
+    const s = srcPts[i], m = smooth[i];
+    // 元の式：重心からの相対変位を高さ比で正規化
+    let tx = sb.cx + (m.x - cb.cx) * k;
+    let ty = sb.cy + (m.y - cb.cy) * k;
+    if (angS !== 0) {
+      const ax = tx - sb.cx, ay = ty - sb.cy;
+      tx = sb.cx + cs*ax - sn*ay;
+      ty = sb.cy + sn*ax + cs*ay;
+    }
+    let dx = (tx - s.x) * egain, dy = (ty - s.y) * egain;
+    const len = Math.hypot(dx, dy);
+    if (len > maxD) { dx *= maxD / len; dy *= maxD / len; }
+    ddx[i] = dx; ddy[i] = dy;
   }
+
+  // 背景は顔全体の平均移動＋回転に、距離で減衰して付く
+  let avx = 0, avy = 0;
+  for (let i = 0; i < nFace; i++) { avx += ddx[i]; avy += ddy[i]; }
+  avx /= nFace; avy /= nFace;
 
   const arr = new Float32Array(tris.length * 3 * 4);
   let o = 0;
@@ -317,23 +298,25 @@ function loop() {
       const s = allPts[id];
       let tx = s.x, ty = s.y;
       if (id < nFace) {
-        tx = s.x + dpx[id] + dex[id];
-        ty = s.y + dpy[id] + dey[id];
-      } else {
+        tx = s.x + ddx[id]; ty = s.y + ddy[id];
+      } else if (bgain > 0) {
         const ni = near[id - nFace];
         const d = Math.hypot(s.x - srcPts[ni].x, s.y - srcPts[ni].y) / faceSize;
         const w = 1 - sstep(0, 1.0, d);
-        if (w > 0.001 && bgain > 0) {
-          let dx = dpx[ni] * w * bgain, dy = dpy[ni] * w * bgain;
-          const len = Math.hypot(dx, dy);
-          if (len > maxO) { dx *= maxO / len; dy *= maxO / len; }
+        if (w > 0.001) {
+          let dx = avx * w * bgain, dy = avy * w * bgain;
+          if (angS !== 0) {
+            const ax = s.x - sb.cx, ay = s.y - sb.cy;
+            dx += (cs*ax - sn*ay - ax) * w * bgain;
+            dy += (sn*ax + cs*ay - ay) * w * bgain;
+          }
           tx = s.x + dx; ty = s.y + dy;
         }
       }
       const dx2 = tx - gx, dy2 = ty - gy, l2 = Math.hypot(dx2, dy2) || 1;
       arr[o++] = s.x; arr[o++] = s.y;
-      arr[o++] = tx + dx2 / l2 * 0.0022;
-      arr[o++] = ty + dy2 / l2 * 0.0022;
+      arr[o++] = tx + dx2 / l2 * 0.0015;
+      arr[o++] = ty + dy2 / l2 * 0.0015;
     }
   }
 
