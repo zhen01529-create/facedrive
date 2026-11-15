@@ -18,7 +18,7 @@
   #pvbtn.on{background:#357;border-color:#357}
   #sliders{display:flex;gap:8px;flex:1 1 100%}
   #sliders label{flex:1 1 0;min-width:0;display:flex;align-items:center;gap:3px;font-size:12px;color:#ccc}
-  #sliders input{flex:1 1 auto;min-width:40px}
+  #sliders input{flex:1 1 auto;min-width:36px}
   #hint{position:fixed;top:calc(10px + env(safe-area-inset-top));left:10px;right:10px;
        color:#aaa;font-size:12px;text-align:center;pointer-events:none}
 
@@ -69,6 +69,7 @@
   <div id="sliders">
     <label>頭<input id="hpow" type="range" min="0" max="300" value="100"></label>
     <label>表情<input id="epow" type="range" min="0" max="300" value="110"></label>
+    <label>奥行<input id="dpow" type="range" min="0" max="300" value="100"></label>
     <label>髪<input id="hairpow" type="range" min="0" max="150" value="100"></label>
     <label>首服<input id="bpow" type="range" min="0" max="200" value="100"></label>
   </div>
@@ -85,7 +86,7 @@ const $ = id => document.getElementById(id);
 const cv = $('cv');
 const gl = cv.getContext('webgl2', { alpha:false, preserveDrawingBuffer:true });
 const hint = $('hint'), btnStart = $('start'), btnCalib = $('calib'), btnRec = $('rec'), pvbtn = $('pvbtn');
-const hpow = $('hpow'), epow = $('epow'), hairpow = $('hairpow'), bpow = $('bpow');
+const hpow = $('hpow'), epow = $('epow'), dpow = $('dpow'), hairpow = $('hairpow'), bpow = $('bpow');
 const pv = $('pv'), pvv = $('pvv'), pvo = $('pvo'), pvt = $('pvt'), pvs = $('pvs'), btnOk = $('ok');
 
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
@@ -99,6 +100,7 @@ const TOL = 4;                                  // 正面の目安の許容角�
 const MOUTH_MAX = 0.05;                         // 口の開きの目安（顔の高さ比）
 const HIST_N = 6;                               // 確定時に平均するフレーム数
 const S_MIN = 0.85, S_MAX = 1.25;               // 顔の拡大縮小の範囲（ズームの暴れ防止）
+const A_MAX = 0.8;                              // 推定する回転角の上限（ラジアン、約45°）
 const MIME = ['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp8','video/webm']
   .find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
 
@@ -107,12 +109,15 @@ let prog, vaoMesh, bufMesh, vaoMouth, bufMouth, srcTex, uUse, uCol;
 
 // 写真側
 let W = 0, H = 0, nF = 0, nV = 0, tris = null, idxCount = 0;
-let PP, Cp = [0,0], rP = 1, wA, wB, ewx, ewy, vtx, TG, restOpen = 0, ready = false;
+let PP, PZ, FM, zN, Cp = [0,0], rP = 1, wA, wB, ewx, ewy, vtx, TG, restOpen = 0, ready = false;
+// PZ = 各点の奥行き（px、顔の中心が0）、FM = 回転の推定に使う点（口より上）、zN = 周囲の点が借りる奥行き
 // wA = 髪・顔まわりが頭に付いて動く度合い、wB = 首・服が付いて動く度合い
 // ewx/ewy = 表情の効き具合（顔の輪郭ではゼロ、内側ほど強い）
 // カメラ側
-let sm = null, base = null, bcx = 0, bcy = 0, den = 1, baseR = 1;
-let ang = null;                                 // 顔の向き {yaw, pitch, roll}（度、平滑化済み）
+let sm = null, smz = null, base = null, bz = null, bzz = 1, bcx = 0, bcy = 0, den = 1, baseR = 1;
+let yawS = 0, pitS = 0;                         // 推定した左右・上下の回転角（ラジアン、平滑化済み）
+const HX = new Float32Array(478), HY = new Float32Array(478);
+let ang = null;                                 // 顔の向き {yaw, pitch, roll}（度、平滑化済み。基準の確認用）
 // 基準の確定
 let calState = 'idle', pvPinned = false, pvTimer = 0, hist = [];
 
@@ -279,12 +284,16 @@ $('file').onchange = async e => {
 
     nF = lm.length;
     PP = new Float32Array(nF * 2);
+    PZ = new Float32Array(nF);
     Cp = [0, 0];
+    let zm = 0;
     for (let i = 0; i < nF; i++) {
       PP[2*i] = lm[i].x * W; PP[2*i+1] = lm[i].y * H;
-      Cp[0] += PP[2*i]; Cp[1] += PP[2*i+1];
+      PZ[i] = lm[i].z * W;                          // 奥行き（x と同じ縮尺）
+      Cp[0] += PP[2*i]; Cp[1] += PP[2*i+1]; zm += PZ[i];
     }
-    Cp[0] /= nF; Cp[1] /= nF;
+    Cp[0] /= nF; Cp[1] /= nF; zm /= nF;
+    for (let i = 0; i < nF; i++) PZ[i] -= zm;       // 顔の中心を奥行き0にする
     let q = 0;
     for (let i = 0; i < nF; i++) q += (PP[2*i]-Cp[0])**2 + (PP[2*i+1]-Cp[1])**2;
     rP = Math.sqrt(q / nF);                       // 顔の大きさの基準（px）
@@ -292,6 +301,7 @@ $('file').onchange = async e => {
 
     // 表情の効き具合：輪郭では0、内側ほど強く。下半分は縦方向（顎の上下）だけ残す
     ewx = new Float32Array(nF); ewy = new Float32Array(nF);
+    FM = new Float32Array(nF);
     const noseY = PP[2*1+1], mouthY = PP[2*13+1];
     for (let i = 0; i < nF; i++) {
       let dm = 1e9;
@@ -300,6 +310,7 @@ $('file').onchange = async e => {
       const low = sstep(noseY, mouthY, PP[2*i+1]);
       ewx[i] = fade;
       ewy[i] = fade + (1 - fade) * low;
+      FM[i] = PP[2*i+1] < mouthY ? 1 : 0;           // 口より上の点だけで回転を推定（口の動きに影響されない）
     }
 
     // 周囲の格子点（顔に近すぎる点は除く）
@@ -307,17 +318,21 @@ $('file').onchange = async e => {
     for (let i = 0; i < nF; i++) pts.push({ x: PP[2*i], y: PP[2*i+1] });
     const gx = GX, gy = Math.max(8, Math.round(GX * H / W));
     const cell = W / gx;
-    const la = [], lb = [];
+    const la = [], lb = [], lz = [];
     for (let j = 0; j <= gy; j++) {
       for (let i = 0; i <= gx; i++) {
         const x = i * W / gx, y = j * H / gy;
-        let d = 1e9;
-        for (let k = 0; k < nF; k++) d = Math.min(d, Math.hypot(x - PP[2*k], y - PP[2*k+1]));
+        let d = 1e9, nk = 0;
+        for (let k = 0; k < nF; k++) {
+          const dd = Math.hypot(x - PP[2*k], y - PP[2*k+1]);
+          if (dd < d) { d = dd; nk = k; }
+        }
         if (d < rP * 0.3) continue;
         if (y > chinY) d *= 1.5;                  // 首から下は追従を弱める
         const dn = d / rP;
         const pin = i === 0 || j === 0 || i === gx || j === gy;
         pts.push({ x, y });
+        lz.push(PZ[nk]);                          // 一番近い顔の点の奥行きを借りる
         if (pin) { la.push(0); lb.push(0); continue; }
 
         if (!seg) {                               // 検出なし：距離だけで決める（簡易モード）
@@ -342,6 +357,7 @@ $('file').onchange = async e => {
     }
     wA = Float32Array.from(la);
     wB = Float32Array.from(lb);
+    zN = Float32Array.from(lz);
     nV = pts.length;
     tris = triangulate(pts);
     if (tris.length < 100) { hint.textContent = 'メッシュ生成に失敗'; return; }
@@ -392,9 +408,12 @@ btnCalib.onclick = resetBase;
 btnOk.onclick = () => {
   if (calState !== 'wait') return;
   if (!hist.length) { pvs.textContent = '顔が見えません\n顔をカメラに映してください'; return; }
-  const acc = new Float32Array(nF * 2);
-  for (const h of hist) for (let i = 0; i < acc.length; i++) acc[i] += h[i];
-  setBase(acc, hist.length);
+  const accP = new Float32Array(nF * 2), accZ = new Float32Array(nF);
+  for (const h of hist) {
+    for (let i = 0; i < accP.length; i++) accP[i] += h.p[i];
+    for (let i = 0; i < nF; i++) accZ[i] += h.z[i];
+  }
+  setBase(accP, accZ, hist.length);
 };
 
 // 小窓のオンオフ（基準の確定中は全画面なので無効）
@@ -409,7 +428,8 @@ const showPv = on => { pv.style.display = on ? (pv.classList.contains('full') ? 
 const setFull = on => { pv.classList.toggle('full', on); };
 
 function resetBase() {
-  base = null; sm = null; hist = [];
+  base = null; sm = null; smz = null; hist = [];
+  yawS = 0; pitS = 0;
   calState = 'wait';
   clearTimeout(pvTimer);
   setFull(true);                                  // 基準を決める間は全画面
@@ -420,16 +440,25 @@ function resetBase() {
   hint.textContent = '';
 }
 
-function setBase(acc, n) {
-  base = new Float32Array(acc.length);
+function setBase(accP, accZ, n) {
+  base = new Float32Array(accP.length);
   bcx = 0; bcy = 0;
-  for (let i = 0; i < acc.length; i++) base[i] = acc[i] / n;
+  for (let i = 0; i < accP.length; i++) base[i] = accP[i] / n;
   const m = base.length / 2;
   for (let i = 0; i < m; i++) { bcx += base[2*i]; bcy += base[2*i+1]; }
   bcx /= m; bcy /= m;
   den = 0;
   for (let i = 0; i < m; i++) den += (base[2*i]-bcx)**2 + (base[2*i+1]-bcy)**2;
   baseR = Math.sqrt(den / m);
+  // 基準の奥行き（顔の中心を0にする）と、回転の推定に使う分母
+  bz = new Float32Array(m);
+  let zmean = 0;
+  for (let i = 0; i < m; i++) { bz[i] = accZ[i] / n; zmean += bz[i]; }
+  zmean /= m;
+  bzz = 0;
+  for (let i = 0; i < m; i++) { bz[i] -= zmean; bzz += FM[i] * bz[i] * bz[i]; }
+  bzz = Math.max(bzz, 1e-6);
+  yawS = 0; pitS = 0;
   calState = 'done';
   pvt.textContent = '✓';
   pvs.textContent = '';
@@ -443,7 +472,7 @@ function setBase(acc, n) {
   }, 600);
 }
 
-/* ---------- 顔の向き（3D回転行列から度数に） ---------- */
+/* ---------- 顔の向き（3D回転行列から度数に。基準の確認用） ---------- */
 function getAngles(r) {
   const m = r.facialTransformationMatrixes?.[0]?.data;
   if (!m || m.length < 16) return null;
@@ -534,7 +563,7 @@ const angText = () => ang
 /* 基準を決めている間の表示更新（毎フレーム）。確定はボタンを押したときだけ */
 function calibrate(cam, vw, vh) {
   if (cam) {                                      // 直近の数フレームを保存しておく
-    hist.push(Float32Array.from(sm));
+    hist.push({ p: Float32Array.from(sm), z: Float32Array.from(smz) });
     if (hist.length > HIST_N) hist.shift();
   } else hist.length = 0;
 
@@ -557,12 +586,15 @@ function loop() {
 
   if (cam) {
     if (!sm) {
-      sm = new Float32Array(nF * 2);
-      for (let i = 0; i < nF; i++) { sm[2*i] = (1 - cam[i].x) * vw; sm[2*i+1] = cam[i].y * vh; }
+      sm = new Float32Array(nF * 2); smz = new Float32Array(nF);
+      for (let i = 0; i < nF; i++) {
+        sm[2*i] = (1 - cam[i].x) * vw; sm[2*i+1] = cam[i].y * vh; smz[i] = cam[i].z * vw;
+      }
     } else {
       for (let i = 0; i < nF; i++) {
         sm[2*i] += ((1 - cam[i].x) * vw - sm[2*i]) * 0.5;
         sm[2*i+1] += (cam[i].y * vh - sm[2*i+1]) * 0.5;
+        smz[i] += (cam[i].z * vw - smz[i]) * 0.5;
       }
     }
   }
@@ -572,12 +604,13 @@ function loop() {
     draw(true);
     return;
   }
+  if (!sm) { draw(true); return; }
   update();
   draw(false);
 }
 
 function update() {
-  const hg = hpow.value / 100, eg = epow.value / 100;
+  const hg = hpow.value / 100, eg = epow.value / 100, dg = dpow.value / 100;
   const hairg = hairpow.value / 100, bg = bpow.value / 100;
   let cx = 0, cy = 0;
   for (let i = 0; i < nF; i++) { cx += sm[2*i]; cy += sm[2*i+1]; }
@@ -594,6 +627,23 @@ function update() {
   const s = clamp(Math.hypot(re, im) / den, S_MIN, S_MAX);
   const th = clamp(Math.atan2(im, re), -1, 1);
   const zr = s * Math.cos(th), zi = s * Math.sin(th);
+  const zz = zr*zr + zi*zi;
+
+  // 姿勢を引いた残りを、頭の座標系で求める
+  let nx = 0, ny = 0;
+  for (let i = 0; i < nF; i++) {
+    const sx = sm[2*i] - cx, sy = sm[2*i+1] - cy;
+    const bx = base[2*i] - bcx, by = base[2*i+1] - bcy;
+    const rx = sx - (zr*bx - zi*by), ry = sy - (zi*bx + zr*by);
+    const hx = (rx*zr + ry*zi) / zz, hy = (ry*zr - rx*zi) / zz;
+    HX[i] = hx; HY[i] = hy;
+    nx += FM[i] * hx * bz[i];                     // 奥行きに比例したずれ ＝ 頭の左右・上下の回転
+    ny += FM[i] * hy * bz[i];
+  }
+  yawS += (clamp(nx / bzz, -A_MAX, A_MAX) - yawS) * 0.5;
+  pitS += (clamp(ny / bzz, -A_MAX, A_MAX) - pitS) * 0.5;
+  const yP = yawS * dg, pP = pitS * dg;           // 写真に与える回転角
+  const cYa = Math.cos(yP), sYa = Math.sin(yP), cPi = Math.cos(pP), sPi = Math.sin(pP);
 
   // 頭の動き（ゲイン付き）
   const f = rP / baseR;
@@ -602,23 +652,24 @@ function update() {
   let Tx = f * hg * (cx - bcx), Ty = f * hg * (cy - bcy);
   const tl = Math.hypot(Tx, Ty), tm = rP * 1.0;   // 顔の移動は顔の大きさ程度まで
   if (tl > tm) { Tx *= tm / tl; Ty *= tm / tl; }
-  const pose = (px, py) => {
+  // 頭を3Dで回してから、画面上の傾き・拡大・移動を加える（鼻など手前の点ほど大きくずれる）
+  const pose = (px, py, pz) => {
     const dx = px - Cp[0], dy = py - Cp[1];
-    return [Cp[0] + Tx + zr2*dx - zi2*dy, Cp[1] + Ty + zi2*dx + zr2*dy];
+    const x1 = dx * cYa + pz * sYa;
+    const z1 = -dx * sYa + pz * cYa;
+    const y1 = dy * cPi + z1 * sPi;
+    return [Cp[0] + Tx + zr2*x1 - zi2*y1, Cp[1] + Ty + zi2*x1 + zr2*y1];
   };
 
-  const maxE = rP * 0.6, zz = zr*zr + zi*zi;
+  const maxE = rP * 0.6;
   for (let i = 0; i < nF; i++) {
-    const sx = sm[2*i] - cx, sy = sm[2*i+1] - cy;
-    const bx = base[2*i] - bcx, by = base[2*i+1] - bcy;
-    // 表情＝姿勢を引いた残り（頭の座標系に戻す）
-    const rx = sx - (zr*bx - zi*by), ry = sy - (zi*bx + zr*by);
-    const hx = (rx*zr + ry*zi) / zz, hy = (ry*zr - rx*zi) / zz;
+    // 表情＝回転で説明できる分も引いた残り
+    const hx = HX[i] - yawS * bz[i], hy = HY[i] - pitS * bz[i];
     let ex = (zr2*hx - zi2*hy) * f * eg * ewx[i];   // 輪郭では0 → 隣の髪と食い違わない
     let ey = (zi2*hx + zr2*hy) * f * eg * ewy[i];
     const l = Math.hypot(ex, ey);
     if (l > maxE) { ex *= maxE / l; ey *= maxE / l; }
-    const [qx, qy] = pose(PP[2*i], PP[2*i+1]);
+    const [qx, qy] = pose(PP[2*i], PP[2*i+1], PZ[i]);
     TG[2*i] = qx + ex; TG[2*i+1] = qy + ey;
     vtx[4*i+2] = TG[2*i] / W; vtx[4*i+3] = TG[2*i+1] / H;
   }
@@ -626,7 +677,7 @@ function update() {
     const i = nF + g, px = vtx[4*i] * W, py = vtx[4*i+1] * H;
     const w = clamp(wA[g] * hairg + wB[g] * bg, 0, 1.2);
     if (w <= 0) { vtx[4*i+2] = vtx[4*i]; vtx[4*i+3] = vtx[4*i+1]; continue; }
-    const [qx, qy] = pose(px, py);
+    const [qx, qy] = pose(px, py, zN[g]);
     vtx[4*i+2] = (px + (qx - px) * w) / W;
     vtx[4*i+3] = (py + (qy - py) * w) / H;
   }
