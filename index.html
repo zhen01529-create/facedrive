@@ -53,14 +53,6 @@ let srcTex = null, tris = [], buf = null, prog = null;
 let video = null, smooth = null, recorder = null, chunks = [], ts = 0;
 let angS = 0, sclS = 1;
 
-// 剛体（頭の向き・距離）推定用の安定点。
-// 額・こめかみ・鼻筋・目尻だけを使い、口・顎・眉・瞼の動きを残差として残す。
-const STABLE = [
-  10,151,9,8,107,336,296,334,293,
-  127,356,234,454,93,323,132,361,58,288,172,397,
-  6,168,197,195,5,4,1,2,98,327,33,133,362,263
-];
-
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 const MAX = 1024;
 
@@ -203,7 +195,6 @@ document.getElementById('file').onchange = async e => {
     for (const p of srcPts) { scx += p.x; scy += p.y; }
     scx /= nFace; scy /= nFace;
     allPts = srcPts.concat(makeFrame(srcPts));
-    // 背景の各点に、いちばん近い顔ランドマークを割り当てる
     near = new Uint16Array(allPts.length - nFace);
     for (let i = nFace; i < allPts.length; i++) {
       let best = 0, bd = 1e9;
@@ -217,7 +208,6 @@ document.getElementById('file').onchange = async e => {
     if (tris.length < 100) { hint.textContent = 'メッシュ生成に失敗'; return; }
     if (!prog) initGL();
     uploadTexture(img);
-    angS = 0; sclS = 1;
     btnStart.disabled = false;
     hint.textContent = `メッシュ ${tris.length} 面。開始を押してください`;
   } catch (err) { hint.textContent = '失敗: ' + err.message; }
@@ -247,69 +237,68 @@ function loop() {
 
   if (cam) {
     for (let i = 0; i < nFace; i++) {
-      smooth[i].x += (1 - cam[i].x - smooth[i].x) * 0.45;
-      smooth[i].y += (cam[i].y - smooth[i].y) * 0.45;
+      smooth[i].x += (1 - cam[i].x - smooth[i].x) * 0.35;
+      smooth[i].y += (cam[i].y - smooth[i].y) * 0.35;
     }
   }
 
-  const sb = box(srcPts), cb = box(smooth);
+  const sb = box(srcPts);
   const faceSize = Math.max(sb.w, sb.h) || 1;
   const gain = (pow.value / 100);
+  const maxP = faceSize * 0.40;   // 姿勢の上限（緩い）
+  const maxE = faceSize * 0.22;   // 表情の上限（専用）
+  const maxO = faceSize * 0.12;   // 背景が付いてくる上限
 
   let ccx = 0, ccy = 0;
   for (let i = 0; i < nFace; i++) { ccx += smooth[i].x; ccy += smooth[i].y; }
   ccx /= nFace; ccy /= nFace;
 
-  // --- 剛体（回転・スケール）は安定点だけで推定 ---
   let re = 0, im = 0, den = 0;
-  for (let s = 0; s < STABLE.length; s++) {
-    const k = STABLE[s];
-    const ax = smooth[k].x - ccx, ay = smooth[k].y - ccy;
-    const bx = srcPts[k].x - scx, by = srcPts[k].y - scy;
+  for (let i = 0; i < nFace; i++) {
+    const ax = smooth[i].x - ccx, ay = smooth[i].y - ccy;
+    const bx = srcPts[i].x - scx, by = srcPts[i].y - scy;
     re += bx*ax + by*ay;
     im += by*ax - bx*ay;
-    den += bx*bx + by*by;
+    den += ax*ax + ay*ay;
   }
   let ang = Math.atan2(im, re);
   if (!rot.checked) ang = 0;
-  let scl = den > 1e-12 ? Math.hypot(re, im) / den : 1;
-  scl = Math.min(1.9, Math.max(0.55, scl));
+  const scl = Math.hypot(re, im) / Math.max(den, 1e-9);
   angS += (ang - angS) * 0.4;
-  sclS += (scl - sclS) * 0.4;
+  sclS += (Math.min(1.8, Math.max(0.5, scl)) - sclS) * 0.4;
 
   const cs = Math.cos(angS), sn = Math.sin(angS);
+  // カメラ顔 → 写真顔 の姿勢（回転・拡大縮小）
+  const poseOf = (px, py) => {
+    const ax = (px - ccx) * sclS, ay = (py - ccy) * sclS;
+    return [scx + cs*ax - sn*ay, scy + sn*ax + cs*ay];
+  };
+  // 姿勢を差し引いた後の残差 = 表情
+  const exprOf = (px, py) => poseOf(px, py);
 
-  // --- 残差 = 実測 - 剛体予測 → ここに表情が乗る ---
-  const resx = new Float32Array(nFace), resy = new Float32Array(nFace);
-  let mx = 0, my = 0;
+  const gx0 = (ccx - scx) * 0.25, gy0 = (ccy - scy) * 0.25;
+  const gl0 = Math.hypot(gx0, gy0), gmax = faceSize * 0.1;
+  const t0x = gl0 > gmax ? gx0 * gmax / gl0 : gx0;
+  const t0y = gl0 > gmax ? gy0 * gmax / gl0 : gy0;
+
+  const dpx = new Float32Array(nFace), dpy = new Float32Array(nFace);
+  const dex = new Float32Array(nFace), dey = new Float32Array(nFace);
+
   for (let i = 0; i < nFace; i++) {
-    const bx = (srcPts[i].x - scx) * sclS, by = (srcPts[i].y - scy) * sclS;
-    const px = ccx + cs*bx - sn*by, py = ccy + sn*bx + cs*by;
-    resx[i] = smooth[i].x - px;
-    resy[i] = smooth[i].y - py;
-    mx += resx[i]; my += resy[i];
-  }
-  mx /= nFace; my /= nFace;
+    const s = srcPts[i];
+    const [qx, qy] = poseOf(s.x, s.y);              // 写真の点が姿勢でどこへ行くか
+    const [rx, ry] = exprOf(smooth[i].x, smooth[i].y); // カメラの点を写真空間へ写した位置
 
-  // 残差の平均 = 顔全体の移動（弱め・上限あり）
-  let t0x = mx * 0.55, t0y = my * 0.55;
-  const gmax = faceSize * 0.22, gl0 = Math.hypot(t0x, t0y);
-  if (gl0 > gmax) { t0x *= gmax / gl0; t0y *= gmax / gl0; }
+    let px = (qx - s.x) + t0x, py = (qy - s.y) + t0y;
+    const pl = Math.hypot(px, py);
+    if (pl > maxP) { px *= maxP / pl; py *= maxP / pl; }
+    dpx[i] = px; dpy[i] = py;
 
-  // 表情成分は平均を引いた局所成分。全体移動とは別枠でゲインとクランプを持つ
-  const E = 1.7;
-  const maxL = faceSize * 0.45;
-  const ddx = new Float32Array(nFace), ddy = new Float32Array(nFace);
-  for (let i = 0; i < nFace; i++) {
-    let ex = (resx[i] - mx) * gain * E;
-    let ey = (resy[i] - my) * gain * E;
+    let ex = (rx - s.x) * 1.6 * gain, ey = (ry - s.y) * 1.6 * gain;
     const el = Math.hypot(ex, ey);
-    if (el > maxL) { ex *= maxL / el; ey *= maxL / el; }
-    ddx[i] = t0x + ex;
-    ddy[i] = t0y + ey;
+    if (el > maxE) { ex *= maxE / el; ey *= maxE / el; }
+    dex[i] = ex; dey[i] = ey;
   }
-
-  const maxO = faceSize * 0.12;
 
   const arr = new Float32Array(tris.length * 3 * 4);
   let o = 0;
@@ -320,13 +309,15 @@ function loop() {
       const s = allPts[id];
       let tx = s.x, ty = s.y;
       if (id < nFace) {
-        tx = s.x + ddx[id]; ty = s.y + ddy[id];
+        tx = s.x + dpx[id] + dex[id];
+        ty = s.y + dpy[id] + dey[id];
       } else {
         const ni = near[id - nFace];
         const d = Math.hypot(s.x - srcPts[ni].x, s.y - srcPts[ni].y) / faceSize;
         const w = 1 - sstep(0, 1.0, d);
         if (w > 0.001) {
-          let dx = ddx[ni] * w * 0.55, dy = ddy[ni] * w * 0.55;
+          // 背景は姿勢のみ（表情は伝えない）
+          let dx = dpx[ni] * w * 0.55, dy = dpy[ni] * w * 0.55;
           const len = Math.hypot(dx, dy);
           if (len > maxO) { dx *= maxO / len; dy *= maxO / len; }
           tx = s.x + dx; ty = s.y + dy;
