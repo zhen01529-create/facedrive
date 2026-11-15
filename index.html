@@ -108,7 +108,7 @@ let prog, vaoMesh, bufMesh, vaoMouth, bufMouth, srcTex, uUse, uCol;
 // 写真側
 let W = 0, H = 0, nF = 0, nV = 0, tris = null, idxCount = 0;
 let PP, Cp = [0,0], rP = 1, wA, wB, ewx, ewy, vtx, TG, restOpen = 0, ready = false;
-// wA = 頭に付いて動く度合い（髪・顔まわり）、wB = 首・服が付いて動く度合い
+// wA = 髪・顔まわりが頭に付いて動く度合い、wB = 首・服が付いて動く度合い
 // ewx/ewy = 表情の効き具合（顔の輪郭ではゼロ、内側ほど強い）
 // カメラ側
 let sm = null, base = null, bcx = 0, bcy = 0, den = 1, baseR = 1;
@@ -330,7 +330,7 @@ $('file').onchange = async e => {
           for (let v = -3; v <= 3; v++) {
             const sx = clamp(x + u * cell * 0.8, 0, W - 1), sy = clamp(y + v * cell * 0.8, 0, H - 1);
             const cls = seg.data[Math.floor(sy / H * seg.h) * seg.w + Math.floor(sx / W * seg.w)];
-            if (cls === 1) a += 1 - 0.5 * sstep(2, 6, dn);              // 髪：頭と一体
+            if (cls === 1) a += 1 - sstep(0.3, 4.2, dn);                 // 髪：顔に近いほど強く、離れるほど弱く（立体感）
             else if (cls === 3) a += 1;                                  // 顔の肌：頭と一体
             else if (cls === 5) a += 1 - sstep(0.5, 2.5, dn);            // その他（ヘアバンド等）
             else if (cls === 2) b += 1 - sstep(0.3, 3.0, dn);            // 首・体の肌
