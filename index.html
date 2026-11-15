@@ -22,7 +22,7 @@
   #hint{position:fixed;top:calc(10px + env(safe-area-inset-top));left:10px;right:10px;
        color:#aaa;font-size:12px;text-align:center;pointer-events:none}
 
-  /* カメラ確認：普段は小窓、基準の撮影中は全画面 */
+  /* カメラ確認：普段は小窓（オンオフ）、基準を決めるときは全画面 */
   #pv{position:fixed;top:calc(44px + env(safe-area-inset-top));right:10px;width:210px;z-index:5;
       display:none;border-radius:12px;overflow:hidden;border:2px solid #555;background:#000}
   #pvbox{position:relative;line-height:0}
@@ -30,18 +30,21 @@
   #pvv,#pvo{position:absolute;inset:0;width:100%;height:100%}
   #pvt{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
        font-size:64px;font-weight:700;color:#4f4;text-shadow:0 0 10px #000;pointer-events:none}
-  #pvs{padding:5px 6px;font-size:11px;line-height:1.35;text-align:center;background:#000c;color:#ddd;
-       min-height:4.2em;white-space:pre-line}
-  #force{display:block;width:100%;border-radius:0;border:0;border-top:1px solid #444;padding:8px;font-size:12px}
+  #pvs,#ok{display:none}
 
   #pv.full{top:0;right:0;left:0;bottom:0;width:auto;border:0;border-radius:0;z-index:20;
-           display:flex;flex-direction:column;align-items:center;justify-content:center;
-           padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
-  #pv.full #pvbox{display:flex;align-items:center;justify-content:center;width:100%}
-  #pv.full #pvm{width:min(100vw, calc((100dvh - 170px) * var(--ar,1.333)))}
+           display:flex;align-items:center;justify-content:center}
+  #pv.full #pvbox{width:min(100vw, calc(100dvh * var(--ar,1.333)))}
   #pv.full #pvt{font-size:min(36vw,200px)}
-  #pv.full #pvs{width:100%;font-size:17px;min-height:3.6em;padding:10px;background:none;color:#fff;box-sizing:border-box}
-  #pv.full #force{width:min(92vw,420px);border:1px solid #666;border-radius:12px;padding:14px;font-size:16px;background:#222;margin-bottom:10px}
+  #pv.full #pvs{display:block;position:absolute;left:0;right:0;
+                bottom:calc(92px + env(safe-area-inset-bottom));
+                padding:8px 12px;text-align:center;font-size:17px;line-height:1.4;color:#fff;
+                white-space:pre-line;text-shadow:0 0 6px #000,0 0 6px #000}
+  #pv.full #ok{display:block;position:absolute;left:50%;transform:translateX(-50%);
+               bottom:calc(20px + env(safe-area-inset-bottom));
+               width:min(92vw,420px);padding:18px;font-size:20px;font-weight:700;
+               border:2px solid #666;border-radius:16px;background:#333;color:#fff}
+  #pv.full #ok.good{background:#2a2;border-color:#4f4}
 </style>
 </head>
 <body>
@@ -54,7 +57,7 @@
     <div id="pvt"></div>
   </div>
   <div id="pvs"></div>
-  <button id="force">今の向きで確定</button>
+  <button id="ok">確定</button>
 </div>
 
 <div id="bar">
@@ -82,15 +85,14 @@ const cv = $('cv');
 const gl = cv.getContext('webgl2', { alpha:false, preserveDrawingBuffer:true });
 const hint = $('hint'), btnStart = $('start'), btnCalib = $('calib'), btnRec = $('rec'), pvbtn = $('pvbtn');
 const hpow = $('hpow'), epow = $('epow'), bpow = $('bpow');
-const pv = $('pv'), pvv = $('pvv'), pvo = $('pvo'), pvt = $('pvt'), pvs = $('pvs'), btnForce = $('force');
+const pv = $('pv'), pvv = $('pvv'), pvo = $('pvo'), pvt = $('pvt'), pvs = $('pvs'), btnOk = $('ok');
 
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
 const MAX = 1024;
 const LIP = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95]; // 口の内側
-const TOL = 4;                                  // 正面とみなす許容角度（度）
-const STABLE_N = 8;                             // 条件を満たし続けるフレーム数（約0.3秒）
-const MOVE_MAX = 0.006;                         // 1フレームあたりの動きの許容（画面幅比）
-const MOUTH_MAX = 0.05;                         // 口の開きの許容（顔の高さ比）
+const TOL = 4;                                  // 正面の目安の許容角度（度）
+const MOUTH_MAX = 0.05;                         // 口の開きの目安（顔の高さ比）
+const HIST_N = 6;                               // 確定時に平均するフレーム数
 const MIME = ['video/mp4;codecs=avc1','video/mp4','video/webm;codecs=vp8','video/webm']
   .find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
 
@@ -101,10 +103,10 @@ let prog, vaoMesh, bufMesh, vaoMouth, bufMouth, srcTex, uUse, uCol;
 let W = 0, H = 0, nF = 0, nV = 0, tris = null, idxCount = 0;
 let PP, Cp = [0,0], rP = 1, wG, vtx, TG, restOpen = 0, ready = false;
 // カメラ側
-let sm = null, base = null, baseAcc = null, baseN = 0, bcx = 0, bcy = 0, den = 1, baseR = 1;
+let sm = null, base = null, bcx = 0, bcy = 0, den = 1, baseR = 1;
 let ang = null;                                 // 顔の向き {yaw, pitch, roll}（度、平滑化済み）
-// 基準の撮影
-let calState = 'idle', pvPinned = false, pvTimer = 0, forceCap = false, prevNose = null;
+// 基準の確定
+let calState = 'idle', pvPinned = false, pvTimer = 0, hist = [];
 
 const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x-a)/(b-a))); return t*t*(3-2*t); };
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
@@ -313,26 +315,36 @@ btnStart.onclick = async () => {
   } catch (err) { hint.textContent = 'カメラ不可: ' + err.message; }
 };
 btnCalib.onclick = resetBase;
-btnForce.onclick = () => { if (calState === 'wait') forceCap = true; };
 
+// 自分で確定：押した直前の数フレームを平均して基準にする
+btnOk.onclick = () => {
+  if (calState !== 'wait') return;
+  if (!hist.length) { pvs.textContent = '顔が見えません\n顔をカメラに映してください'; return; }
+  const acc = new Float32Array(nF * 2);
+  for (const h of hist) for (let i = 0; i < acc.length; i++) acc[i] += h[i];
+  setBase(acc, hist.length);
+};
+
+// 小窓のオンオフ（基準の確定中は全画面なので無効）
 pvbtn.onclick = () => {
+  if (calState !== 'done') return;
   pvPinned = !pvPinned;
   pvbtn.classList.toggle('on', pvPinned);
-  if (calState === 'done') showPv(pvPinned);
+  showPv(pvPinned);
 };
 
 const showPv = on => { pv.style.display = on ? (pv.classList.contains('full') ? 'flex' : 'block') : 'none'; };
 const setFull = on => { pv.classList.toggle('full', on); };
 
 function resetBase() {
-  base = null; baseAcc = null; baseN = 0; sm = null; prevNose = null;
-  calState = 'wait'; forceCap = false;
+  base = null; sm = null; hist = [];
+  calState = 'wait';
   clearTimeout(pvTimer);
-  setFull(true);                                  // 基準の撮影中は全画面
+  setFull(true);                                  // 基準を決める間は全画面
   showPv(true);
-  btnForce.style.display = 'block';
+  btnOk.classList.remove('good');
   pvt.textContent = '';
-  pvs.textContent = '●を中央の輪に入れてください';
+  pvs.textContent = '●を中央の輪に入れて、整ったら「確定」を押してください';
   hint.textContent = '';
 }
 
@@ -347,17 +359,16 @@ function setBase(acc, n) {
   for (let i = 0; i < m; i++) den += (base[2*i]-bcx)**2 + (base[2*i+1]-bcy)**2;
   baseR = Math.sqrt(den / m);
   calState = 'done';
-  btnForce.style.display = 'none';
   pvt.textContent = '✓';
-  pvs.textContent = '基準を確定しました';
+  pvs.textContent = '';
   hint.textContent = '';
+  clearGuide();
   clearTimeout(pvTimer);
-  pvTimer = setTimeout(() => {                    // 少し見せてから元の画面に戻る
+  pvTimer = setTimeout(() => {                    // ✓を少し見せてから元の画面に戻る
     pvt.textContent = '';
     setFull(false);
-    showPv(pvPinned);
-  }, 700);
-  clearGuide();
+    showPv(pvPinned);                             // 小窓は「窓」ボタンでオンにしたときだけ
+  }, 600);
 }
 
 /* ---------- 顔の向き（3D回転行列から度数に） ---------- */
@@ -378,7 +389,7 @@ function smoothAngles(a) {
   for (const k of ['yaw', 'pitch', 'roll']) ang[k] += (a[k] - ang[k]) * 0.4;
 }
 
-/* 正面を向けているか。OKなら空文字、だめなら理由を返す */
+/* 正面の目安。OKなら空文字、だめなら理由を返す（確定自体は押せば常にできる） */
 function faceCheck(cam, vw, vh) {
   let cx = 0, cy = 0;
   for (const p of cam) { cx += p.x; cy += p.y; }
@@ -398,14 +409,13 @@ function faceCheck(cam, vw, vh) {
     const yaw = ((n.x - (a.x + b.x) / 2) * vw) / dist;
     if (Math.abs(yaw) > 0.1) return 'まっすぐ正面を向いてください';
   }
-  // 口を閉じた無表情を基準にする
   const faceH = Math.hypot((cam[152].x - cam[10].x) * vw, (cam[152].y - cam[10].y) * vh);
   const mouth = Math.hypot((cam[14].x - cam[13].x) * vw, (cam[14].y - cam[13].y) * vh) / faceH;
   if (mouth > MOUTH_MAX) return '口を閉じてください';
   return '';
 }
 
-function drawGuide(cam, ok, vw, vh, progress) {
+function drawGuide(cam, ok, vw, vh) {
   const c = pvo.getContext('2d');
   c.clearRect(0, 0, pvo.width, pvo.height);
   const lw = Math.max(3, vw / 120);
@@ -426,17 +436,6 @@ function drawGuide(cam, ok, vw, vh, progress) {
   c.moveTo(cx - TOL * k * 1.8, cy); c.lineTo(cx + TOL * k * 1.8, cy);
   c.moveTo(cx, cy - TOL * k * 1.8); c.lineTo(cx, cy + TOL * k * 1.8);
   c.stroke();
-
-  // 確定までの進行リング
-  if (progress > 0) {
-    c.lineWidth = Math.max(5, vw / 70);
-    c.strokeStyle = '#4f4';
-    c.lineCap = 'round';
-    c.beginPath();
-    c.arc(cx, cy, TOL * k * 2.6, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * progress);
-    c.stroke();
-    c.lineCap = 'butt';
-  }
 
   if (cam && ang) {
     const dx = clamp(ang.yaw * k, -vw * 0.3, vw * 0.3);
@@ -460,37 +459,18 @@ const angText = () => ang
   ? `左右 ${ang.yaw.toFixed(0)}°  上下 ${ang.pitch.toFixed(0)}°  傾き ${ang.roll.toFixed(0)}°`
   : '';
 
-/* 基準の確定処理：いい状態が続いた瞬間に自動で確定（毎フレーム呼ばれる） */
+/* 基準を決めている間の表示更新（毎フレーム）。確定はボタンを押したときだけ */
 function calibrate(cam, vw, vh) {
-  if (forceCap && cam) {                          // 手動確定：今の状態をすぐ採用
-    setBase(Float32Array.from(sm), 1);
-    return;
-  }
+  if (cam) {                                      // 直近の数フレームを保存しておく
+    hist.push(Float32Array.from(sm));
+    if (hist.length > HIST_N) hist.shift();
+  } else hist.length = 0;
 
-  let msg = cam ? faceCheck(cam, vw, vh) : '顔が見えません';
-  const aimed = msg === '';
-
-  // 顔が止まっているか（鼻先の1フレームの動き）
-  if (cam) {
-    const nx = sm[2], ny = sm[3];
-    const moved = prevNose ? Math.hypot(nx - prevNose[0], ny - prevNose[1]) / vw : 0;
-    prevNose = [nx, ny];
-    if (aimed && moved > MOVE_MAX) msg = '少し止まってください';
-  } else prevNose = null;
-
-  if (msg === '') {                               // いい状態：平均用に蓄積
-    if (!baseAcc) { baseAcc = new Float32Array(nF * 2); baseN = 0; }
-    for (let i = 0; i < sm.length; i++) baseAcc[i] += sm[i];
-    baseN++;
-    drawGuide(cam, true, vw, vh, baseN / STABLE_N);
-    pvs.textContent = 'そのままキープ\n' + angText();
-    if (baseN >= STABLE_N) setBase(baseAcc, baseN);  // 確定
-    return;
-  }
-
-  baseAcc = null; baseN = 0;                      // 外れたら最初から
-  drawGuide(cam, false, vw, vh, 0);
-  pvs.textContent = msg + '\n' + angText();
+  const msg = cam ? faceCheck(cam, vw, vh) : '顔が見えません';
+  const ok = msg === '';
+  drawGuide(cam, ok, vw, vh);
+  btnOk.classList.toggle('good', ok);
+  pvs.textContent = (ok ? '正面です。よければ「確定」を押してください' : msg) + '\n' + angText();
 }
 
 /* ---------- メインループ ---------- */
@@ -516,7 +496,7 @@ function loop() {
   }
 
   if (!base) {
-    if (sm) calibrate(cam, vw, vh); else { drawGuide(null, false, vw, vh, 0); pvs.textContent = '顔が見えません'; }
+    if (calState === 'wait') calibrate(cam, vw, vh);
     draw(true);
     return;
   }
