@@ -73,13 +73,8 @@ function initGL() {
   in vec2 vUV; out vec4 o;
   uniform sampler2D uTex;
   void main(){ o = texture(uTex, vUV); }`;
-  const mk = (t, s) => {
-    const sh = gl.createShader(t);
-    gl.shaderSource(sh, s);
-    gl.compileShader(sh);
-    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
-    return sh;
-  };
+  const mk = (t, s) => { const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh)); return sh; };
   prog = gl.createProgram();
   gl.attachShader(prog, mk(gl.VERTEX_SHADER, vs));
   gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, fs));
@@ -95,10 +90,7 @@ function initGL() {
 
 function uploadTexture(img) {
   let w = img.width, h = img.height;
-  if (Math.max(w, h) > MAX) {
-    const s = MAX / Math.max(w, h);
-    w = Math.round(w*s); h = Math.round(h*s);
-  }
+  if (Math.max(w, h) > MAX) { const s = MAX / Math.max(w, h); w = Math.round(w*s); h = Math.round(h*s); }
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
   c.getContext('2d').drawImage(img, 0, 0, w, h);
@@ -122,11 +114,8 @@ function circ(P, t) {
 
 function triangulate(pts) {
   const n = pts.length;
-  let mnx=1e9, mny=1e9, mxx=-1e9, mxy=-1e9;
-  for (const p of pts) {
-    mnx=Math.min(mnx,p.x); mny=Math.min(mny,p.y);
-    mxx=Math.max(mxx,p.x); mxy=Math.max(mxy,p.y);
-  }
+  let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9;
+  for (const p of pts) { mnx=Math.min(mnx,p.x); mny=Math.min(mny,p.y); mxx=Math.max(mxx,p.x); mxy=Math.max(mxy,p.y); }
   const d = Math.max(mxx-mnx, mxy-mny) * 10, cx=(mnx+mxx)/2, cy=(mny+mxy)/2;
   const P = pts.concat([{x:cx-d,y:cy-d},{x:cx,y:cy+d},{x:cx+d,y:cy-d}]);
   let t = [{a:n,b:n+1,c:n+2}];
@@ -137,36 +126,25 @@ function triangulate(pts) {
       if ((p.x-c.x)**2 + (p.y-c.y)**2 < c.r2) bad.push(tr); else keep.push(tr);
     }
     const edge = new Map();
-    for (const tr of bad) {
-      for (const [u,v] of [[tr.a,tr.b],[tr.b,tr.c],[tr.c,tr.a]]) {
-        const k = u < v ? u+','+v : v+','+u;
-        edge.set(k, (edge.get(k) || 0) + 1);
-      }
+    for (const tr of bad) for (const [u,v] of [[tr.a,tr.b],[tr.b,tr.c],[tr.c,tr.a]]) {
+      const k = u < v ? u+','+v : v+','+u;
+      edge.set(k, (edge.get(k) || 0) + 1);
     }
     t = keep;
-    for (const [k, c] of edge) {
-      if (c === 1) {
-        const [u,v] = k.split(',').map(Number);
-        t.push({a:u,b:v,c:i});
-      }
-    }
+    for (const [k, c] of edge) if (c === 1) { const [u,v] = k.split(',').map(Number); t.push({a:u,b:v,c:i}); }
   }
   const span = Math.max(mxx-mnx, mxy-mny);
   return t.filter(tr => {
     if (tr.a>=n || tr.b>=n || tr.c>=n) return false;
-    const A=P[tr.a], B=P[tr.b], C=P[tr.c];
-    const e = Math.max(
-      Math.hypot(A.x-B.x, A.y-B.y),
-      Math.hypot(B.x-C.x, B.y-C.y),
-      Math.hypot(C.x-A.x, C.y-A.y));
+    const A=P[tr.a],B=P[tr.b],C=P[tr.c];
+    const e = Math.max(Math.hypot(A.x-B.x,A.y-B.y), Math.hypot(B.x-C.x,B.y-C.y), Math.hypot(C.x-A.x,C.y-A.y));
     const area = Math.abs((B.x-A.x)*(C.y-A.y) - (C.x-A.x)*(B.y-A.y)) / 2;
     return e < span * 0.32 && area > 1e-7;
   });
 }
 
 document.getElementById('file').onchange = async e => {
-  const f = e.target.files[0];
-  if (!f) return;
+  const f = e.target.files[0]; if (!f) return;
   hint.textContent = '顔を検出中...';
   try {
     const img = new Image();
@@ -182,17 +160,14 @@ document.getElementById('file').onchange = async e => {
     uploadTexture(img);
     btnStart.disabled = false;
     hint.textContent = `メッシュ ${tris.length} 面。開始を押してください`;
-  } catch (err) {
-    hint.textContent = '失敗: ' + err.message;
-  }
+  } catch (err) { hint.textContent = '失敗: ' + err.message; }
 };
 
 btnStart.onclick = async () => {
   try {
     if (!video) {
       video = document.createElement('video');
-      video.playsInline = true;
-      video.muted = true;
+      video.playsInline = true; video.muted = true;
       const st = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'user', width: 480, height: 360 }, audio: false });
       video.srcObject = st;
@@ -201,17 +176,12 @@ btnStart.onclick = async () => {
     btnRec.disabled = false;
     hint.textContent = '';
     loop();
-  } catch (err) {
-    hint.textContent = 'カメラ不可: ' + err.message;
-  }
+  } catch (err) { hint.textContent = 'カメラ不可: ' + err.message; }
 };
 
 const box = pts => {
-  let a=1e9, b=1e9, c=-1e9, d=-1e9;
-  for (const p of pts) {
-    a=Math.min(a,p.x); b=Math.min(b,p.y);
-    c=Math.max(c,p.x); d=Math.max(d,p.y);
-  }
+  let a=1e9,b=1e9,c=-1e9,d=-1e9;
+  for (const p of pts) { a=Math.min(a,p.x); b=Math.min(b,p.y); c=Math.max(c,p.x); d=Math.max(d,p.y); }
   return { cx:(a+c)/2, cy:(b+d)/2, h:d-b };
 };
 
@@ -229,6 +199,7 @@ function loop() {
 
   const sb = box(srcPts), cb = box(smooth);
   const k = sb.h / Math.max(cb.h, 1e-4);
+
   const arr = new Float32Array(tris.length * 3 * 4);
   let o = 0;
   for (const tr of tris) {
