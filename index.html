@@ -98,7 +98,7 @@ const OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400
               148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];          // 顔の輪郭
 const UTOP = 10, UCHIN = 152;                   // 顔のてっぺん側と顎の点
 const MID = [33,133,362,263,1,168];             // 目と鼻の点（上下の向きを測る）
-const FACE_SHIFT_MAX = 0.2;                     // 顔面の移動量の上限（顔の高さに対する割合）
+const FACE_SHIFT_MAX = 0.14;                    // 顔面の移動量の上限（顔の高さに対する割合）
 const TOL = 4;                                  // 正面の目安の許容角度（度）
 const MOUTH_MAX = 0.05;                         // 口の開きの目安（顔の高さ比）
 const HIST_N = 6;                               // 確定時に平均するフレーム数
@@ -111,9 +111,10 @@ let prog, vaoMesh, bufMesh, vaoMouth, bufMouth, srcTex, uUse, uCol;
 
 // 写真側
 let W = 0, H = 0, nF = 0, nV = 0, tris = null, idxCount = 0;
-let PP, Cp = [0,0], rP = 1, wA, wB, wT, lD, ewx, ewy, spanP = 1, vtx, TG, restOpen = 0, ready = false;
+let PP, Cp = [0,0], rP = 1, wA, wB, wT, lD, ewx, ewy, spanP = 1, yTopLm = 0, headTopY = 0, vtx, TG, restOpen = 0, ready = false;
 // wA = 髪・顔まわりが頭に付いて動く度合い、wB = 首・服が付いて動く度合い
 // wT = 頭・首・服（人物）である度合い（背景は0）、lD = 顔からの距離（顔の大きさ単位）
+// yTopLm = 顔の一番上の高さ、headTopY = 頭のてっぺんの高さ
 // ewx/ewy = 表情の効き具合（顔の輪郭ではゼロ、内側ほど強い）
 // カメラ側
 let sm = null, base = null, bcx = 0, bcy = 0, den = 1, baseR = 1, u0 = 0.4, duS = 0;
@@ -294,9 +295,11 @@ $('file').onchange = async e => {
     nF = lm.length;
     PP = new Float32Array(nF * 2);
     Cp = [0, 0];
+    yTopLm = 1e9;
     for (let i = 0; i < nF; i++) {
       PP[2*i] = lm[i].x * W; PP[2*i+1] = lm[i].y * H;
       Cp[0] += PP[2*i]; Cp[1] += PP[2*i+1];
+      yTopLm = Math.min(yTopLm, PP[2*i+1]);         // 顔の一番上の高さ
     }
     Cp[0] /= nF; Cp[1] /= nF;
     let q = 0;
@@ -304,6 +307,23 @@ $('file').onchange = async e => {
     rP = Math.sqrt(q / nF);                       // 顔の大きさの基準（px）
     const chinY = PP[2*152+1];
     spanP = Math.max(chinY - PP[2*UTOP+1], 1);    // 顔の高さ（てっぺん〜顎）
+
+    // 頭のてっぺんの高さ：顔の中心付近の列で、人物（髪・肌）が始まる一番上の行
+    let headTop = yTopLm - 2.2 * rP;              // 検出できないときの目安
+    if (seg) {
+      const xa = clamp(Cp[0] - 1.5 * rP, 0, W - 1), xb = clamp(Cp[0] + 1.5 * rP, 0, W - 1);
+      let found = -1;
+      for (let y = 0; y < yTopLm && found < 0; y++) {
+        let cnt = 0;
+        for (let x = xa; x <= xb; x += 4) {
+          const cls = seg.data[Math.floor(y / H * seg.h) * seg.w + Math.floor(x / W * seg.w)];
+          if (cls === 1 || cls === 3 || cls === 5) cnt++;
+        }
+        if (cnt >= 3) found = y;
+      }
+      if (found >= 0) headTop = found;
+    }
+    headTopY = clamp(headTop, 0, yTopLm - 0.5 * rP);
 
     // 表情の効き具合：輪郭では0、内側ほど強く。下半分は縦方向（顎の上下）だけ残す
     ewx = new Float32Array(nF); ewy = new Float32Array(nF);
@@ -649,6 +669,7 @@ function update() {
     TG[2*i+1] = qy + ey + faceD;                    // 顔面を全部そろえて上下にスライド（顔の形は変えない）
     vtx[4*i+2] = TG[2*i] / W; vtx[4*i+3] = TG[2*i+1] / H;
   }
+  const headSpan = Math.max(yTopLm - headTopY, 1); // 顔の上端〜頭のてっぺんの距離
   for (let g = 0; nF + g < nV; g++) {             // 髪・首・服は、分類に応じた度合いで頭に付いて動く
     const i = nF + g, px = vtx[4*i] * W, py = vtx[4*i+1] * H;
     const w = clamp(wA[g] * hairg + wB[g] * bg, 0, 1.2);
@@ -657,10 +678,19 @@ function update() {
       const [qx, qy] = pose(px, py);
       tx = px + (qx - px) * w; ty = py + (qy - py) * w;
     }
-    // 顔のすぐ隣の髪・肌だけは、顔面のスライドを少し分けてもらう（顔との境目の食い違い防止）。
-    // 頭の輪郭や背景には届かないので、頭のシルエットは動かない
-    const share = (1 - sstep(0.3, 0.9, lD[g])) * clamp(wT[g], 0, 1);
-    ty += faceD * share;
+    // 顔面のスライドを、周りの髪・肌に分ける。
+    // ・顔のすぐ隣：顔と同じだけ動く（境目の食い違い防止）
+    // ・顔より上（前髪〜頭頂）：顔の上端で最大、頭のてっぺんで0になるよう一様に減らす。
+    //   縮みが頭全体に薄く広がるので、前髪が潰れない。頭のてっぺん（シルエット）は動かない
+    const near = 1 - sstep(0.3, 0.9, lD[g]);
+    let above = 0;
+    const hh = yTopLm - py;
+    if (hh > 0) {
+      const t = clamp(hh / headSpan, 0, 1);
+      const xf = 1 - sstep(1.2, 2.6, Math.abs(px - Cp[0]) / rP);   // 顔から横に離れた髪は動かさない
+      above = (1 - t) * xf * sstep(0, 0.25 * rP, hh);
+    }
+    ty += faceD * Math.max(near, above) * clamp(wT[g], 0, 1);
     vtx[4*i+2] = tx / W; vtx[4*i+3] = ty / H;
   }
 }
