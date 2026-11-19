@@ -16,9 +16,9 @@
   button:disabled{opacity:.4}
   #rec.on{background:#c33;border-color:#c33}
   #pvbtn.on{background:#357;border-color:#357}
-  #sliders{display:flex;gap:8px;flex:1 1 100%}
+  #sliders{display:flex;gap:6px;flex:1 1 100%}
   #sliders label{flex:1 1 0;min-width:0;display:flex;align-items:center;gap:3px;font-size:12px;color:#ccc}
-  #sliders input{flex:1 1 auto;min-width:36px}
+  #sliders input{flex:1 1 auto;min-width:30px}
   #hint{position:fixed;top:calc(10px + env(safe-area-inset-top));left:10px;right:10px;
        color:#aaa;font-size:12px;text-align:center;pointer-events:none}
 
@@ -69,7 +69,8 @@
   <div id="sliders">
     <label>頭<input id="hpow" type="range" min="0" max="300" value="100"></label>
     <label>表情<input id="epow" type="range" min="0" max="300" value="110"></label>
-    <label>顔位置<input id="tpow" type="range" min="0" max="300" value="100"></label>
+    <label>上下<input id="tpow" type="range" min="0" max="300" value="100"></label>
+    <label>左右<input id="xpow" type="range" min="0" max="300" value="100"></label>
     <label>髪<input id="hairpow" type="range" min="0" max="150" value="100"></label>
     <label>首服<input id="bpow" type="range" min="0" max="200" value="100"></label>
   </div>
@@ -86,7 +87,7 @@ const $ = id => document.getElementById(id);
 const cv = $('cv');
 const gl = cv.getContext('webgl2', { alpha:false, preserveDrawingBuffer:true });
 const hint = $('hint'), btnStart = $('start'), btnCalib = $('calib'), btnRec = $('rec'), pvbtn = $('pvbtn');
-const hpow = $('hpow'), epow = $('epow'), tpow = $('tpow'), hairpow = $('hairpow'), bpow = $('bpow');
+const hpow = $('hpow'), epow = $('epow'), tpow = $('tpow'), xpow = $('xpow'), hairpow = $('hairpow'), bpow = $('bpow');
 const pv = $('pv'), pvv = $('pvv'), pvo = $('pvo'), pvt = $('pvt'), pvs = $('pvs'), btnOk = $('ok');
 
 const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
@@ -98,7 +99,9 @@ const OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400
               148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];          // 顔の輪郭
 const UTOP = 10, UCHIN = 152;                   // 顔のてっぺん側と顎の点
 const MID = [33,133,362,263,1,168];             // 目と鼻の点（上下の向きを測る）
-const FACE_SHIFT_MAX = 0.14;                    // 顔面の移動量の上限（顔の高さに対する割合）
+const EYE_L = 33, EYE_R = 263, NOSE = 1;        // 左右の向きを測る点（目尻2つと鼻先）
+const FACE_SHIFT_MAX = 0.14;                    // 顔面の上下の移動量の上限（顔の高さに対する割合）
+const FACE_SHIFT_X_MAX = 0.25;                  // 顔面の左右の移動量の上限（顔の幅に対する割合）
 const TOL = 4;                                  // 正面の目安の許容角度（度）
 const MOUTH_MAX = 0.05;                         // 口の開きの目安（顔の高さ比）
 const HIST_N = 6;                               // 確定時に平均するフレーム数
@@ -111,13 +114,15 @@ let prog, vaoMesh, bufMesh, vaoMouth, bufMouth, srcTex, uUse, uCol;
 
 // 写真側
 let W = 0, H = 0, nF = 0, nV = 0, tris = null, idxCount = 0;
-let PP, Cp = [0,0], rP = 1, wA, wB, wT, lD, ewx, ewy, spanP = 1, yTopLm = 0, headTopY = 0, vtx, TG, restOpen = 0, ready = false;
+let PP, Cp = [0,0], rP = 1, wA, wB, wT, lD, ewx, ewy, spanP = 1, yTopLm = 0, headTopY = 0;
+let faceL = 0, faceR = 0, faceWP = 1, headL = 0, headR = 0, vtx, TG, restOpen = 0, ready = false;
 // wA = 髪・顔まわりが頭に付いて動く度合い、wB = 首・服が付いて動く度合い
 // wT = 頭・首・服（人物）である度合い（背景は0）、lD = 顔からの距離（顔の大きさ単位）
 // yTopLm = 顔の一番上の高さ、headTopY = 頭のてっぺんの高さ
+// faceL/faceR = 顔の左端/右端、headL/headR = 頭（髪）の左端/右端、faceWP = 顔の幅
 // ewx/ewy = 表情の効き具合（顔の輪郭ではゼロ、内側ほど強い）
 // カメラ側
-let sm = null, base = null, bcx = 0, bcy = 0, den = 1, baseR = 1, u0 = 0.4, duS = 0;
+let sm = null, base = null, bcx = 0, bcy = 0, den = 1, baseR = 1, u0 = 0.4, duS = 0, v0 = 0, dvS = 0;
 let ang = null;                                 // 顔の向き {yaw, pitch, roll}（度、平滑化済み）
 // 基準の確定
 let calState = 'idle', pvPinned = false, pvTimer = 0, hist = [];
@@ -132,6 +137,11 @@ function uOf(a) {
   m /= MID.length;
   const t = a[2*UTOP+1], c = a[2*UCHIN+1];
   return (m - t) / Math.max(c - t, 1e-3);
+}
+// 鼻が左右の目の中央から、横にどれだけずれているか（目の間隔に対する割合。右を向くと正）
+function vOf(a) {
+  const l = a[2*EYE_L], r = a[2*EYE_R], n = a[2*NOSE];
+  return (n - (l + r) / 2) / Math.max(Math.abs(r - l), 1e-3);
 }
 
 async function boot() {
@@ -295,13 +305,16 @@ $('file').onchange = async e => {
     nF = lm.length;
     PP = new Float32Array(nF * 2);
     Cp = [0, 0];
-    yTopLm = 1e9;
+    yTopLm = 1e9; faceL = 1e9; faceR = -1e9;
     for (let i = 0; i < nF; i++) {
       PP[2*i] = lm[i].x * W; PP[2*i+1] = lm[i].y * H;
       Cp[0] += PP[2*i]; Cp[1] += PP[2*i+1];
       yTopLm = Math.min(yTopLm, PP[2*i+1]);         // 顔の一番上の高さ
+      faceL = Math.min(faceL, PP[2*i]);             // 顔の左端
+      faceR = Math.max(faceR, PP[2*i]);             // 顔の右端
     }
     Cp[0] /= nF; Cp[1] /= nF;
+    faceWP = Math.max(faceR - faceL, 1);
     let q = 0;
     for (let i = 0; i < nF; i++) q += (PP[2*i]-Cp[0])**2 + (PP[2*i+1]-Cp[1])**2;
     rP = Math.sqrt(q / nF);                       // 顔の大きさの基準（px）
@@ -310,6 +323,8 @@ $('file').onchange = async e => {
 
     // 頭のてっぺんの高さ：顔の中心付近の列で、人物（髪・肌）が始まる一番上の行
     let headTop = yTopLm - 2.2 * rP;              // 検出できないときの目安
+    // 頭（髪）の左右の端：顔の中心の高さで、左右に背景にぶつかるまで進んだ位置
+    let hl = Cp[0] - 2.0 * rP, hr = Cp[0] + 2.0 * rP;
     if (seg) {
       const xa = clamp(Cp[0] - 1.5 * rP, 0, W - 1), xb = clamp(Cp[0] + 1.5 * rP, 0, W - 1);
       let found = -1;
@@ -322,8 +337,16 @@ $('file').onchange = async e => {
         if (cnt >= 3) found = y;
       }
       if (found >= 0) headTop = found;
+
+      const ry = clamp(Math.floor(Cp[1] / H * seg.h), 0, seg.h - 1);
+      const cxm = clamp(Math.floor(Cp[0] / W * seg.w), 0, seg.w - 1);
+      let xl = cxm; while (xl > 0 && seg.data[ry * seg.w + xl] !== 0) xl--;
+      let xr = cxm; while (xr < seg.w - 1 && seg.data[ry * seg.w + xr] !== 0) xr++;
+      hl = xl / seg.w * W; hr = xr / seg.w * W;
     }
     headTopY = clamp(headTop, 0, yTopLm - 0.5 * rP);
+    headL = clamp(hl, 0, faceL - 0.3 * rP);
+    headR = clamp(hr, faceR + 0.3 * rP, W);
 
     // 表情の効き具合：輪郭では0、内側ほど強く。下半分は縦方向（顎の上下）だけ残す
     ewx = new Float32Array(nF); ewy = new Float32Array(nF);
@@ -447,7 +470,7 @@ const showPv = on => { pv.style.display = on ? (pv.classList.contains('full') ? 
 const setFull = on => { pv.classList.toggle('full', on); };
 
 function resetBase() {
-  base = null; sm = null; hist = []; duS = 0;
+  base = null; sm = null; hist = []; duS = 0; dvS = 0;
   calState = 'wait';
   clearTimeout(pvTimer);
   setFull(true);                                  // 基準を決める間は全画面
@@ -469,7 +492,8 @@ function setBase(acc, n) {
   for (let i = 0; i < m; i++) den += (base[2*i]-bcx)**2 + (base[2*i+1]-bcy)**2;
   baseR = Math.sqrt(den / m);
   u0 = uOf(base);                                 // 基準での、目・鼻の上下の位置の割合
-  duS = 0;
+  v0 = vOf(base);                                 // 基準での、鼻の左右の位置
+  duS = 0; dvS = 0;
   calState = 'done';
   pvt.textContent = '✓';
   pvs.textContent = '';
@@ -618,7 +642,7 @@ function loop() {
 }
 
 function update() {
-  const hg = hpow.value / 100, eg = epow.value / 100, tg = tpow.value / 100;
+  const hg = hpow.value / 100, eg = epow.value / 100, tg = tpow.value / 100, xg = xpow.value / 100;
   const hairg = hairpow.value / 100, bg = bpow.value / 100;
   let cx = 0, cy = 0;
   for (let i = 0; i < nF; i++) { cx += sm[2*i]; cy += sm[2*i+1]; }
@@ -636,10 +660,15 @@ function update() {
   const th = clamp(Math.atan2(im, re), -1, 1);
   const zr = s * Math.cos(th), zi = s * Math.sin(th);
 
-  // 上を向くと、目・鼻が顔の上のほうへ寄る（割合が小さくなる）。その変化量から、
-  // 「頭に対する顔面の位置」のずれを決める。上を向くと負（上へ）、下を向くと正（下へ）
+  // 上を向くと、目・鼻が顔の上のほうへ寄る。その変化量から、頭に対する顔面の上下の位置を決める
   duS += (clamp(uOf(sm) - u0, -0.2, 0.2) - duS) * 0.5;
   const faceD = clamp(duS * spanP * tg, -FACE_SHIFT_MAX * spanP, FACE_SHIFT_MAX * spanP);
+
+  // 横を向くと、鼻が目の中央から横にずれる。その変化量から、頭に対する顔面の左右の位置を決める
+  dvS += (clamp(vOf(sm) - v0, -0.6, 0.6) - dvS) * 0.5;
+  const faceDx = clamp(dvS * faceWP * 0.6 * xg, -FACE_SHIFT_X_MAX * faceWP, FACE_SHIFT_X_MAX * faceWP);
+  // 横を向いているときは、表情の横方向の効きを弱める（目・鼻の折れ防止。口の開きなど縦方向は残す）
+  const yawAtt = 1 - 0.8 * sstep(0.05, 0.25, Math.abs(dvS));
 
   // 頭の動き（ゲイン付き）
   const f = rP / baseR;
@@ -660,13 +689,13 @@ function update() {
     // 表情＝姿勢を引いた残り（頭の座標系に戻す）
     const rx = sx - (zr*bx - zi*by), ry = sy - (zi*bx + zr*by);
     const hx = (rx*zr + ry*zi) / zz, hy = (ry*zr - rx*zi) / zz;
-    let ex = (zr2*hx - zi2*hy) * f * eg * ewx[i];   // 輪郭では0 → 隣の髪と食い違わない
+    let ex = (zr2*hx - zi2*hy) * f * eg * ewx[i] * yawAtt;   // 輪郭では0 → 隣の髪と食い違わない
     let ey = (zi2*hx + zr2*hy) * f * eg * ewy[i];
     const l = Math.hypot(ex, ey);
     if (l > maxE) { ex *= maxE / l; ey *= maxE / l; }
     const [qx, qy] = pose(PP[2*i], PP[2*i+1]);
-    TG[2*i] = qx + ex;
-    TG[2*i+1] = qy + ey + faceD;                    // 顔面を全部そろえて上下にスライド（顔の形は変えない）
+    TG[2*i] = qx + ex + faceDx;                     // 顔面を全部そろえて左右にスライド（顔の形は変えない）
+    TG[2*i+1] = qy + ey + faceD;                    // 顔面を全部そろえて上下にスライド
     vtx[4*i+2] = TG[2*i] / W; vtx[4*i+3] = TG[2*i+1] / H;
   }
   const headSpan = Math.max(yTopLm - headTopY, 1); // 顔の上端〜頭のてっぺんの距離
@@ -680,8 +709,9 @@ function update() {
     }
     // 顔面のスライドを、周りの髪・肌に分ける。
     // ・顔のすぐ隣：顔と同じだけ動く（境目の食い違い防止）
-    // ・顔より上（前髪〜頭頂）：顔の上端で最大、頭のてっぺんで0になるよう一様に減らす。
-    //   縮みが頭全体に薄く広がるので、前髪が潰れない。頭のてっぺん（シルエット）は動かない
+    // ・顔より上（前髪〜頭頂）：顔の上端で最大、頭のてっぺんで0になるよう一様に減らす
+    // ・顔の左右（耳・横の髪）：顔の端で最大、頭の左右の端で0になるよう一様に減らす
+    //   縮み・伸びが頭全体に薄く広がり、頭のシルエットは動かない
     const near = 1 - sstep(0.3, 0.9, lD[g]);
     let above = 0;
     const hh = yTopLm - py;
@@ -690,7 +720,13 @@ function update() {
       const xf = 1 - sstep(1.2, 2.6, Math.abs(px - Cp[0]) / rP);   // 顔から横に離れた髪は動かさない
       above = (1 - t) * xf * sstep(0, 0.25 * rP, hh);
     }
-    ty += faceD * Math.max(near, above) * clamp(wT[g], 0, 1);
+    let side = 0;
+    if (px > faceR) side = 1 - clamp((px - faceR) / Math.max(headR - faceR, 1), 0, 1);
+    else if (px < faceL) side = 1 - clamp((faceL - px) / Math.max(faceL - headL, 1), 0, 1);
+    side *= 1 - sstep(1.0, 2.2, Math.abs(py - Cp[1]) / rP);        // 顔の高さから離れた髪（肩まで垂れた部分）は動かさない
+    const wt = clamp(wT[g], 0, 1);
+    ty += faceD * Math.max(near, above) * wt;
+    tx += faceDx * Math.max(near, above, side) * wt;
     vtx[4*i+2] = tx / W; vtx[4*i+3] = ty / H;
   }
 }
